@@ -59,8 +59,9 @@ west build -b qemu_x86 demo/zephyr_broker
 The NanoNNG library is built by an ExternalProject
 ([demo/cmake/nanonng_external.cmake](../cmake/nanonng_external.cmake))
 into `build/zephyr_broker/nanonng_build/`, mirroring the NanoNNG
-`zephyr_mqtt` demo's build.  RAM footprint of the linked image: ~1.35 MB
-(1 MB of it the libc malloc arena — see below).
+`zephyr_mqtt` demo's build.  RAM footprint of the linked image: ~2.4 MB
+of the qemu_x86 31 MB RAM (≈1 MB of it the libc malloc arena — see
+below).
 
 ### Why the big malloc arena
 
