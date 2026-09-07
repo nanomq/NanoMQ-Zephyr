@@ -1,0 +1,15 @@
+# NanoMQ broker demo options
+#
+# An application-level Kconfig file replaces the top of the Zephyr tree
+# (kconfig.cmake: KCONFIG_ROOT = <app>/Kconfig when it exists), so the
+# whole Zephyr tree must be pulled back in explicitly.  See
+# samples/basic/minimal/Kconfig for the same pattern.
+
+config BROKER_LOG_DEBUG
+	bool "Set NanoMQ log level to DEBUG"
+	help
+	  Bumps nanolib log level from the default WARN to DEBUG so the
+	  MQTT session flow is visible on the console.  Disable for normal
+	  runs (less noise, fewer cycles in log formatting).
+
+source "Kconfig.zephyr"
