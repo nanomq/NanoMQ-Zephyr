@@ -81,6 +81,7 @@
 #include <unistd.h>
 #endif
 
+#if !defined(__ZEPHYR__) // Zephyr: no POSIX signal semantics, main loop below is enough
 #if (defined DEBUG) && (defined ASAN)
 int keepRunning = 1;
 void
@@ -124,6 +125,7 @@ void sig_handler(int signum)
 }
 #endif
 #endif
+#endif // !defined(__ZEPHYR__)
 
 enum options {
 	OPT_HELP = 1,
@@ -1380,6 +1382,7 @@ broker(conf *nanomq_conf)
 	bool is_testing = false;
 #endif
 
+#if !defined(__ZEPHYR__) // Zephyr: no POSIX signal installation
 #if (defined DEBUG)  && (defined ASAN)
 	signal(SIGINT, intHandler);
 #else
@@ -1399,6 +1402,7 @@ broker(conf *nanomq_conf)
 	} while (all_signals[i++] != SIGTERM);
 #endif
 #endif
+#endif // !defined(__ZEPHYR__)
 
 #if (defined DEBUG) && (defined ASAN)
 	if (is_testing == true) {

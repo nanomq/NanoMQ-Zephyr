@@ -22,7 +22,9 @@
 #include <errno.h>
 #include <signal.h>
 #include <netinet/in.h>
+#ifndef __ZEPHYR__ // Zephyr has no ptrace; check_trace() is a stub there
 #include <sys/ptrace.h>
+#endif
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/types.h>
