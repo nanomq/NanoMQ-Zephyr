@@ -254,6 +254,13 @@ main(void)
 	// keepalive/session expiry are checked once per qos_duration.  Shorten
 	// to 1s so persistent-session & keepalive scenarios respond promptly.
 	nmq_conf->qos_duration = 1;
+	// MQTT 5 topic aliases.  conf_init leaves max_topic_alias 0, so the
+	// CONNACK advertises TOPIC_ALIAS_MAXIMUM=0 and every PUBLISH carrying a
+	// topic alias is rejected (pub_handler.c handle_pub → "Invalid Topic
+	// Alias ... Server Max allowed: 0").  The host test conf sets 1024
+	// (.github/scripts/nanomq.conf on master); mirror it so the CI v5
+	// suite's topic-alias case means the same thing here.
+	nmq_conf->max_topic_alias = 1024;
 #ifdef CONFIG_BROKER_LOG_DEBUG
 	nmq_conf->log.level    = NNG_LOG_DEBUG;
 #endif
