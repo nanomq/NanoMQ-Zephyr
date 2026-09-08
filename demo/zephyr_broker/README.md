@@ -21,10 +21,15 @@ Three layers of changes, kept apart deliberately:
 | broker bug fix | `nano_nni_lmq_fini`/`nano_nni_lmq_resize` freed the in-struct `lmq_buf` when the rlmq never grew (guard `lmq_alloc > 0`, mirroring `core/lmq.c`) — heap corruption on client disconnect on Zephyr | `nng/` submodule (commit in this branch) |
 | Demo | this directory | `demo/zephyr_broker` |
 
-Two NanoNNG no-FS platform gaps are filled by small stubs compiled into
-the app ([src/process_stub.c](src/process_stub.c),
-[src/nng_plat_stub.c](src/nng_plat_stub.c)) instead of patching the
-submodule.
+The one POSIX-only piece nng itself cannot build on Zephyr is the
+broker's `process.c` (fork/kill/chdir) — a small app-side stand-in
+([src/process_stub.c](src/process_stub.c)) provides its symbols.  The
+NanoNNG no-FS file gap this demo originally papered over
+(`nni_plat_file_exists/size` missing from `zephyr_file.c`, which broke
+linking `nanolib`'s file.c/log.c) is fixed in the submodule instead:
+both `zephyr_file.c` branches now implement the probes (commit
+`21daab5`), exposed as a public API — `nng_file_exists` /
+`nng_file_size` in `nng.h` (commit `c66e0cb`).
 
 ## Environment prerequisite — Zephyr e1000 driver patch
 

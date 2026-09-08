@@ -26,11 +26,9 @@ set(NNG_ROOT ${NANOMQ_ROOT}/nng)
 #     (process.h) are provided by src/process_stub.c instead.
 #   * plugin/plugin.c excluded — NNG_ENABLE_PLUGIN off.
 #   * tests/ excluded — NANOMQ_TESTS off.
-# src/nng_plat_stub.c fills a gap in NanoNNG's no-FS zephyr_file.c.
 target_sources(app PRIVATE
   src/main.c
   src/process_stub.c
-  src/nng_plat_stub.c
   ${NANOMQ_ROOT}/nanomq/bridge.c
   ${NANOMQ_ROOT}/nanomq/pub_handler.c
   ${NANOMQ_ROOT}/nanomq/sub_handler.c
