@@ -53,7 +53,7 @@ nng 通过 `nni_plat_*` 接口隔离平台。Zephyr 平台实现位于 NanoNNG
 | `nni_alloc` | `zephyr_alloc.c` = 裸 `malloc()` | **libc malloc arena 就是 broker 堆**(§5.3 的 1 MB 配置由此而来;`CONFIG_HEAP_MEM_POOL_SIZE` 只服务 `k_malloc()`,对 nng 无效) |
 | 时钟/睡眠/随机 | `zephyr_clock.c` 等 | keepalive 定时、重传退避可用 |
 | 网络传输 | Zephyr 原生 socket(BSD 兼容层) | tcp/ws 传输走 poll 驱动;无 IPC 传输(`NNG_TRANSPORT_IPC=OFF`) |
-| 文件系统 | 无 FS 分支(`zephyr_file.c` 的 no-FS stub) | `nni_plat_file_exists/size` **缺失**,由 demo 的 `nng_plat_stub.c` 补齐(上游候选修复) |
+| 文件系统 | 无 FS 分支(`zephyr_file.c` 的 no-FS stub) | `nni_plat_file_exists/size` 已上提补齐(commit `21daab5`,§4):no-FS 分支 stub(exists→false,size→`NNG_ENOTSUP`),FS 分支为 `stat()` 实现 |
 | taskq/poller | 固定线程数(见 ExternalProject:`TASKQ=2/POLLER=1/EXPIRE=1`) | broker 并发受限于此,叠加 §5.6 的 pthread 池 |
 | POSIX API | Zephyr `CONFIG_POSIX_API` + 动态线程池 | nng 平台与 broker 的 pthread 都来自 16 线程池(§5.6) |
 
@@ -68,7 +68,6 @@ broker 应用层的 POSIX 残留是唯一硬阻断,统一用 `__ZEPHYR__` 预定
 | `nanomq.c` | `#include <sys/ptrace.h>` | 门控;`check_trace()` 调用点仅在 CLI 路径(不达),平台无实现不报错 |
 | `mqtt_api.c` | `nng_access(dir, W_OK)`(文件日志目录检查) | 门控;文件日志后端对嵌入式恒关(`LOG_TO_FILE` 不设),跳过检查无副作用 |
 | `process.c`(整个编译单元剔除) | fork/kill/chdir/`<paths.h>` | 由 demo `process_stub.c` 提供 6 个 `process.h` 符号(返回 -1)。被引用点全部位于 `daemon=true`/CLI 路径,嵌入式 broker 永不触达 |
-| nng no-FS stub | `nni_plat_file_exists/size` 缺失 | demo `nng_plat_stub.c` 补齐(exists→false,size→`NNG_ENOTSUP`) |
 
 ### 3.3 编译期宏契约(应用与 libnng 必须一致)
 
@@ -82,7 +81,7 @@ broker 应用层的 POSIX 残留是唯一硬阻断,统一用 `__ZEPHYR__` 预定
 
 ## 4. 改动内容(文件级清单)
 
-### nng 子模块(NanoNNG,commit `f4db38440`)
+### nng 子模块(NanoNNG,commit `c66e0cb`)
 `src/sp/protocol/mqtt/nmq_mqtt.c` — 真实 broker bug 修复:
 `nano_nni_lmq_fini()` / `nano_nni_lmq_resize()` 无条件 `nni_free(lmq->lmq_msgs)`。
 当 rlmq cap ≤ 2 或扩容 malloc 失败时,`nni_lmq_init` 把队列数组放在
@@ -99,7 +98,7 @@ demo/zephyr_broker/CMakeLists.txt   SOURCES 镜像 + 宏契约(§3.3)
 demo/zephyr_broker/Kconfig          app 级 Kconfig 壳(KCONFIG_ROOT 语义)
 demo/zephyr_broker/prj.conf         资源/网络配置(§5.3)
 demo/zephyr_broker/src/main.c       入口:conf 最小覆盖 → broker()
-demo/zephyr_broker/src/process_stub.c / nng_plat_stub.c   §3.2
+demo/zephyr_broker/src/process_stub.c      §3.2(nng 文件缺口已上提,§4)
 demo/zephyr_broker/accept.sh        宿主验收脚本(§6.2)
 demo/zephyr_broker/README.md        构建/运行/验收速览
 ```
@@ -126,6 +125,14 @@ MQTT 3.1.1/5 客户端(`--clean/--keepalive/--expiry/--expect/--proto`),
 `src/platform/zephyr/zephyr_pollq_poll.c` — `poll()` 失败降级与 100 ms
 超时轮询(§7-10)。
 
+**nng 文件探针补齐(commits `21daab5` + `c66e0cb`,superproject bump `2e4fb162`)**:
+`zephyr_file.c` 的 no-FS 与 FS 两个分支此前都未实现
+`nni_plat_file_exists/size`(platform.h 声明、posix/win 均已实现)——nanolib
+`file.c`(`nano_file_exists`)与 `log.c` 无条件引用,消费即缺符号(§3.1),
+demo 原以 `nng_plat_stub.c` 兜底,本次上提后该文件与 CMake 条目一并删除;
+core/file 增 `nni_file_exists/size` 中间层,公共 `nng.h` 暴露
+`nng_file_exists`/`nng_file_size`(nng.c 封装,对齐既有 `nng_file_*` 族)。
+
 ### Zephyr 环境补丁(不在本仓库,§5.4)
 `drivers/ethernet/eth_e1000.{c,priv.h}` — RCTL_BAM(上游缺失 bug)。
 
@@ -134,7 +141,7 @@ MQTT 3.1.1/5 客户端(`--clean/--keepalive/--expiry/--expect/--proto`),
 ### 5.1 环境
 - Zephyr 4.x west workspace(SDK 含 qemu_x86 hosttools);Zephyr checkout **必须**含 §5.4 补丁
 - 本文档开发环境:docker 容器 `zephyr-tap`,`ZephyrProject` 目录 bind-mount 到 `/workdir`;宿主 Fedora 提供 mosquitto-clients(仅验收用)
-- 代码同步:`git submodule update --init nng`(锁定 `f4db38440`)
+- 代码同步:`git submodule update --init nng`(锁定 `c66e0cb`)
 
 ### 5.2 构建
 ```sh
@@ -260,8 +267,9 @@ REST 走 `:8081`,webhook 接收器 `hook_receiver.py` 挂在 10.0.2.2 别名
 对应的容器内。
 
 1. **Zephyr 上游修复跟进**(待办):eth_e1000 RCTL_BAM 提 PR(上游缺失,
-   2026-06 核实,§5.4);另 nng no-FS stub 缺 `nni_plat_file_exists/size`
-   可上提 NanoNNG
+   2026-06 核实,§5.4)。nng no-FS stub 缺 `nni_plat_file_exists/size` 一项
+   已于 2026-09 上提修复(commit `21daab5`/`c66e0cb`,§4),demo 兜底 stub
+   随之删除
 2. **WS 传输实测**(待办):`nmq-ws://` 已编入(`NNG_TRANSPORT_MQTT_BROKER_WS=ON`),
    未做端到端用例(需宿主 ws 客户端)
 3. **TLS/QUIC/SQLite/Parquet**(保持关闭):NanoNNG Zephyr 移植明确未包含
