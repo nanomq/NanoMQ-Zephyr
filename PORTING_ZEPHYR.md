@@ -170,11 +170,14 @@ docker exec -u root zephyr-tap sh -lc '
 CONFIG_POSIX_API=y / POSIX_THREAD_THREADS_MAX=16 / DYNAMIC_THREAD_STACK_SIZE=16384
 CONFIG_ETH_E1000=y                         # SLIRP 只认以太网 L2,必须有真实 NIC 驱动
 CONFIG_NET_QEMU_USER=y
-CONFIG_NET_QEMU_USER_EXTRA_ARGS="hostfwd=tcp:0.0.0.0:1883-:1883,hostfwd=tcp:0.0.0.0:8081-:8081"  # 8081=REST(§9-4)
+CONFIG_NET_QEMU_USER_EXTRA_ARGS="hostfwd=tcp:0.0.0.0:1883-:1883,hostfwd=tcp:0.0.0.0:8081-:8081,hostfwd=tcp:0.0.0.0:8083-:8083"  # 8081=REST(§9-4),8083=WS(§9-2)
 CONFIG_NET_CONFIG_MY_IPV4_ADDR="10.0.2.15" # SLIRP 固定 guest 概念地址
 CONFIG_COMMON_LIBC_MALLOC_ARENA_SIZE=1048576   # ★ MMU 下 malloc arena 即 broker 堆
-CONFIG_ZVFS_POLL_MAX=16 / CONFIG_MAX_PTHREAD_MUTEX_COUNT=1024  # §7-10/11
-CONFIG_BROKER_REST_API=y / CONFIG_BROKER_WEBHOOK=y              # §9-4;webhook 需 host 接收器
+CONFIG_ZVFS_POLL_MAX=64 / MAX_PTHREAD_MUTEX/COND_COUNT=1024     # §7-10/11/18
+CONFIG_MAX_PTHREAD_RWLOCK_COUNT=256                            # §7-21(topic 树节点按把)
+CONFIG_NET_MAX_CONTEXTS=32 / CONFIG_NET_MAX_CONN=32            # ★ §7-18 连接池
+CONFIG_ZVFS_OPEN_ADD_SIZE_NET=32                               #   zvfs fd 表
+CONFIG_BROKER_REST_API=y / CONFIG_BROKER_WEBHOOK=y / CONFIG_BROKER_WS=y   # §9-4;WS 见 §9-2
 CONFIG_X86_SSE/SSE2/SSE3(SSSE3 禁)
 CONFIG_BROKER_LOG_DEBUG=y                  # 调试用;正式运行可关
 ```
@@ -190,7 +193,7 @@ docker exec -u root zephyr-tap sh -lc '
     -m 32 -cpu qemu32,+nx,+pae,sse,sse2,pni -machine q35 \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 -no-reboot -machine acpi=off \
     -serial file:/tmp/qemu3.log -display none \
-    -netdev user,id=n1,hostfwd=tcp:0.0.0.0:1883-:1883,hostfwd=tcp:0.0.0.0:8081-:8081 \
+    -netdev user,id=n1,hostfwd=tcp:0.0.0.0:1883-:1883,hostfwd=tcp:0.0.0.0:8081-:8081,hostfwd=tcp:0.0.0.0:8083-:8083 \
     -device e1000,netdev=n1 \
     -kernel /workdir/build/zephyr_broker/zephyr/zephyr.elf &'
 ```
@@ -199,14 +202,16 @@ docker exec -u root zephyr-tap sh -lc '
 `broker: NanoMQ (ver 0.25.1) Serving HTTP Server on http://(null):8081` →
 `NanoMQ Broker is started successfully!`。日志时间为**真实 UTC**(demo
 main.c 启动时从 QEMU CMOS RTC 播种 CLOCK_REALTIME,2026-09 修复;
-Zephyr 无 TZ 数据库,显示恒为 UTC,见 §8)。hostfwd 双端口(1883/8081)与
+Zephyr 无 TZ 数据库,显示恒为 UTC,见 §8)。hostfwd 三端口(1883/8081/8083)与
 prj.conf `CONFIG_NET_QEMU_USER_EXTRA_ARGS` 一致 —— `west build -t run`
-会自动带上,手动 qemu 必须显式列出,漏 8081 则 REST(§9-4)不通。
+会自动带上,手动 qemu 必须显式列出,漏 8081 则 REST(§9-4)不通,漏
+8083 则 WS(§9-2)不通。
 客户端落点:宿主 mosquitto/accept.sh → 容器 IP(`docker inspect -f
 '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' zephyr-tap`,
 实测 172.17.0.2):1883,或经宿主 socat 转发用 127.0.0.1(命令见 demo
 README);容器内 python(mqtt_accept.py/hook_receiver.py) → 127.0.0.1;
-宿主 curl → 容器 IP:8081(容器内无 mosquitto/curl)。
+宿主 curl → 容器 IP:8081(容器内无 mosquitto/curl);宿主 paho
+(`transport="websockets"`,路径 `/mqtt`)→ 容器 IP:8083。
 **必需环境补丁(RCTL_BAM)**:QEMU e1000 设备模型复位后清零 RCTL(真实硬件
 默认置位 BAM=bit15),Zephyr `eth_e1000` 驱动从不置 BAM → **所有广播帧
 (ARP!)被模型静默丢弃**,SLIRP 永远无法完成首个 TCP 连接。
@@ -278,6 +283,10 @@ iow32(dev, RCTL, RCTL_EN | RCTL_MPE | RCTL_BAM | DT_INST_PROP(inst, rdmts) << RD
 | 15 | REST `clients` 查询恒空 | 返回 JSON 顶层键是 `data`(非 `clients`) | 轮询脚本取 `data` 数组 | 脚本 |
 | 16 | 每 host↔guest 交换固定 ~110 ms(QoS1 PUBACK、PINGRESP 等) | Zephyr TCP delayed-ACK(`tcp.c ACK_DELAY=K_MSEC(100)`,RFC 813:无 PSH 段或小窗口时推迟 ACK ~100 ms) | 识别为栈特性非缺陷;QoS0 单向数据面不受影响(§9-10) | 环境(Zephyr 栈) |
 | 17 | DEBUG 日志镜像吞吐骤降(qos0 ~150-250 msg/s) | 每包多次 DEBUG 经仿真串口,串口是吞吐瓶颈(~380 行/s) | 压测用静默镜像(临时去 `CONFIG_BROKER_LOG_DEBUG`),产线默认关 | 方法/环境 |
+| 18 | 并发/连发新连接被 RST(mosquitto `Connection was lost`,CI v5 套件逐轮随机失败) | Zephyr 连接池默认过小:`NET_MAX_CONTEXTS=6`(每 socket 一个 context)+`NET_MAX_CONN=8`,两个 listener 已占 2;池尽时 `tcp_conn_new()` 的 `net_context_get()` 失败 → `net_tcp_reply_rst()`(`subsys/net/ip/tcp.c`),客户端见 RST | prj.conf 提池:`NET_MAX_CONTEXTS/NET_MAX_CONN=32`、`ZVFS_OPEN_ADD_SIZE_NET=32`、`ZVFS_POLL_MAX=64`(§9-12) | 配置 |
+| 19 | 无流量时 guest CPU ~90% 自旋(webhook 接收器未启动时必现) | webhook 的 HTTP 出站拨号失败后该 pfd 未被 fini,仍以 POLLOUT(0x04)挂在 pollq;`poll()` 每轮都报 POLLERR(0x08),而 `pfd->events &= ~events` 用 0x08 清不掉 0x04 → 每轮立即返回,空转 | nng `zephyr_pollq_poll.c`:revents 含 POLLERR/POLLHUP/POLLNVAL 时置 `pfd->events = 0`(该描述符已不可用,重挂或拆除交由回调决定);复现脚本 CPU 86–94% → 1.3–3.0% | nng 平台修复 |
+| 20 | WS 反复连接/断开后 broker 停摆:新连接能 CONNACK,但管道不再收发也不回收 | `nmq_websocket.c` 的 `wstran_pipe_recv_cancel` 先清空 `p->user_rxaio` 再 abort rxaio,却没完成用户 aio(完成行被注释掉);rxaio 的完成路径见 `user_rxaio` 已空即跳过完成 → 该 aio 永久挂起 → `nano_pipe_stop` 中 `nni_aio_stop(&p->aio_recv)` 阻塞全局唯一的 reap 线程 → 所有 pipe 回收停摆 | 采用上游修复 `6467b6c` + `1d8127c`(两个 cancel 路径都完成用户 aio;cb 在 `skip:`/`reset:` 先释放 `user_rxaio` 再完成;qsaio 回调不再无锁读 `user_txaio`);gdb 复核 reap 线程空闲、pollq 仅剩 3 个 listener fd | 真实 bug(上游已修) |
+| 21 | 生存组压到 ~30 个主题时 guest `panic: pthread_rwlock_init: pool exhausted` → 客户端 `Connection refused` | Zephyr rwlock 为固定池(默认 32),nanolib 每个 topic 树节点取一把(`mqtt_db.c` 的 `dbtree_node_new`/`dbtree_node_free` 成对),负载测试的主题数轻易超池 | prj.conf `CONFIG_MAX_PTHREAD_RWLOCK_COUNT=256`(§5.3/§9-13);宿主 POSIX 无固定池,仅 Zephyr 需显式预算 | 配置 |
 
 ## 8. 局限与已知取舍
 - 线程模型:nng 平台 poller/taskq + POSIX 动态线程池上限 16(`CONFIG_POSIX_THREAD_THREADS_MAX`),broker 连接并发受其约束;栈 16 KB/线程
@@ -304,8 +313,16 @@ REST 走 `:8081`,webhook 接收器 `hook_receiver.py` 挂在 10.0.2.2 别名
    2026-06 核实,§5.4)。nng no-FS stub 缺 `nni_plat_file_exists/size` 一项
    已于 2026-09 上提修复(commit `21daab5`/`c66e0cb`,§4),demo 兜底 stub
    随之删除
-2. **WS 传输实测**(待办):`nmq-ws://` 已编入(`NNG_TRANSPORT_MQTT_BROKER_WS=ON`),
-   未做端到端用例(需宿主 ws 客户端)
+2. **WS 传输**(✅ 2026-09-08 端到端验证):demo 加运行时 WS 监听
+   (`CONFIG_BROKER_WS` → main.c 设 `websocket.enable/url`,§5.3)+ SLIRP
+   8083 hostfwd;宿主 paho(`transport="websockets"`,路径 `/mqtt`)与
+   CI `ws_test.py`(v3.1.1)/`ws_v5_test.py`(v5)全绿(§9-13)。两处此前
+   未暴露的缺陷随之修复:① `nng/src/sp/transport/CMakeLists.txt:32` 的
+   门控写成从未定义的 `NNG_TRANSPORT_MQTT_WS`,导致 mqttws 传输在**所有**
+   构建里被静默排除(demo 的 `NNG_TRANSPORT_MQTT_BROKER_WS=ON` 一直空转),
+   改为 `NNG_TRANSPORT_MQTT_BROKER_WS OR ..._WSS`;② WS 管道回收停摆
+   (§7-20,上游已修,采用 `6467b6c`+`1d8127c`)。TLS(`nmq-wss://`)仍不可用
+   (NanoNNG Zephyr 关闭 TLS)
 3. **TLS/QUIC/SQLite/Parquet**(保持关闭):NanoNNG Zephyr 移植明确未包含
    (NNG_ENABLE_TLS/QUIC/SQLITE=OFF);如需支持需先在 NanoNNG 完成
 4. **HTTP/REST/Webhook**(✅ 行为已验证,2026-09;rule-engine 除外):
@@ -356,6 +373,77 @@ REST 走 `:8081`,webhook 接收器 `hook_receiver.py` 挂在 10.0.2.2 别名
     - DEBUG 日志经仿真串口是主要瓶颈(§7-17);并发受 §8 线程/栈预算约束
     - SLIRP 是代理网络,qemu 数值与真实网络/板卡不可比 —— 数据面结论
       需在真实网络/板卡上复测(§8-9)
+11. **CI 功能测试套件在 qemu 镜像上跑通**(✅ 2026-09-08):
+    `.github/scripts/` 中适用于本 demo 的子集全绿 —— `mqtt_test.py`
+    (v3.1.1)、`mqtt_test_v5.py`、`rest_api_test.py`(其余套件需 TLS/WS
+    监听或宿主 nanomq 二进制,不适用)。此前 v5 套件 7 轮全败、失败点在
+    会话过期/user-property/共享订阅间漂移,根因即 §7-18 连接池耗尽(池尽
+    即 RST),非 broker 语义缺陷:提池 + `max_topic_alias`(见下)后
+    **3/3 连续全绿**;实测同一条连接池,6 并发 CONNECT 由 2/6 变 6/6、
+    50 ms 间隔连发由 9/20 变 20/20。另发现 `test_topic_alias` 依赖
+    `mqtt.max_topic_alias`:`conf_init` 默认 0(CONNACK 广播
+    `TOPIC_ALIAS_MAXIMUM=0`,带别名的 PUBLISH 被拒),宿主 CI conf 在
+    **master** 上是 `max_topic_alias=1024`、develop 分支缺该行 —— demo
+    main.c 现按 1024 对齐。运行须知:宿主 python 走系统代理会把
+    `172.17.0.2:8081` 打成 502,跑 REST 套件需 `NO_PROXY=<容器 IP>`;
+    本 demo 侧套件(§9-13)的 REST 组只做 GET(不碰会翻转运行配置的
+    POST `/reload`)
+12. **VFS 支持变体**(待定,2026-09 评估):做"可挂文件系统、进而按宿主
+    方式解析 HOCON 配置/落盘"的编译开关版本。nng 平台层 `zephyr_file.c`
+    已按 Zephyr 官方 Kconfig `CONFIG_FILE_SYSTEM` 分双分支(无 FS 桩:
+    exists→false/size→ENOTSUP;有 FS:POSIX 风格真实实现,§4 `21daab5`
+    起)—— 宏开关在 nng 层是现成架构,但开关只是必要条件,剩余门槛:
+    ① 宏双侧注入(本 demo 的 libnng 是 ExternalProject 独立构建,看不到
+    prj.conf 的 Kconfig,须 `NNG_EXTRA_CFLAGS -DCONFIG_FILE_SYSTEM`,守
+    §3.3 宏契约);② 板级介质与挂载(storage 分区/dts + `fs_mount`,须先于
+    conf 解析,qemu_x86 默认无介质);③ 路径主机假设(`/etc/nanomq.conf`、
+    conf_file 推导须映射到 VFS 挂载点);④ 激活整层被桩代码(日志落盘/
+    pid/license 等逐条审计);⑤ 双变体(no-FS 基线 + VFS)验证与腐烂成本。
+    触发条件:真实板需要运行时改配置/持久会话落盘;此前维持内嵌最小
+    conf(§1),无动作
+13. **Zephyr 专用功能测试套件**(✅ 2026-09-08 8/8 全绿):
+    `demo/zephyr_broker/function_test.py` —— 宿主侧 runner,自管 qemu
+    生命周期(杀旧实例 → 全新日志名启动 → 轮询就绪串 → 结束回收),8 组
+    各以独立子进程执行(组级崩溃/超时隔离),`--group` 单组重跑、
+    `--no-manage` 复用已在跑的 broker、`--list` 列组、`-v` 显示通过组输出。
+    复用 `.github/scripts/` 模块而**不改其代码**:mqtt 组覆写模块级
+    `g_addr/g_port/g_url`;ws_v311 包一层 `Test.init`;ws_v5 打
+    `paho.mqtt.client.Client.connect` 补丁(该脚本硬编码 `localhost:8083`)。
+    组表与实测时长:
+
+    | 组 | 驱动 | 实测 |
+    |---|---|---|
+    | mqtt_v311 | CI `mqtt_test.py` | 16.1 s |
+    | mqtt_v5 | CI `mqtt_test_v5.py` | 28.0 s |
+    | rest_get | 自写(7 条路由 + `/configuration/websocket` 镜像运行 conf) | 0.9 s |
+    | ws_v311 | CI `ws_test.py`(WS 上 MQTT 3.1.1) | 209.5 s |
+    | ws_v5 | CI `ws_v5_test.py`(WS 上 MQTT 5) | 6.1 s |
+    | webhook_smoke | 自写(`hook_receiver.py` 收 `client_connack`/`message_publish`) | 2.8 s |
+    | capacity | 自写(12 并发 CONNECT + QoS1 echo,连接池回归) | 6.2 s |
+    | survival | `survival_test.py`(缩规模 `attack.py` + 压后探活) | 33.4 s |
+
+    - 定位:CI `test.py` 在本 demo 不可用(需宿主 nanomq 二进制 + TLS/WS
+      listener,并驱动 mosquitto CLI/TLS/鉴权等宿主侧工具),故按同样的
+      "复用模块、注入地址"思路做 Zephyr 版
+    - 抖动如实记录:ws_v5 修前首跑 11.7 s 失败,原因是树内
+      `.github/scripts/ws_v5_test.py` 为旧版 —— 把 CONNECT 专属属性
+      `MaximumPacketSize` 设进 PUBLISH 属性,paho 2.x 在客户端线程抛
+      `MQTTException`,v5 发布端全部未能连接;换上游 master 版本(其
+      `func()` 自行处理 `conn_prop`,并给等待加上界)后 6.1 s 通过。ws 组
+      默认多一次重试(`--retry-ws`):上游脚本用固定 sleep 适配宿主 broker,
+      SLIRP 延迟下首跑可能抖动;真实抖动不做隐藏
+    - 生存组压出 §7-21(rwlock 池耗尽),修复后 33.4 s 通过;组内
+      `attack.py` 常量缩规模(30 s、2 发布者、8 噪声客户端、2 节点共享
+      订阅):宿主规模是崩溃放大器,SLIRP 每连接约 9 msg/s
+    - 失败语义:默认跑完全部组(`--fail-fast` 可停);FAIL 组打印末 40 行
+      输出 + 串口日志尾部;组失败 exit 1,结构性失败(docker/qemu/依赖
+      缺失)exit 2
+    - 失败路径实测(2026-09-08):① `--no-manage --addr 10.255.255.1` →
+      `ERROR: no broker answering` / exit 2;② 组间容器内 pkill qemu →
+      日志 `broker not answering — restarting qemu`,该组计 FAIL(exit 1),
+      后续组在新 guest 上自动继续并通过(实测 `pass=2 fail=1`)
+    - 完整用法与组说明见 demo README「Functional test suite」;命令速查见
+      §10 第 3b 步
 
 ## 10. 复现命令速查(容器环境 `zephyr-tap`,§5.1)
 ```sh
@@ -368,6 +456,10 @@ docker exec -u root zephyr-tap sh -lc 'cd /workdir/nanomq && ZEPHYR_TOOLCHAIN_VA
 docker exec zephyr-tap sh -lc 'grep -a "NanoMQ Broker is started" /tmp/qemu3.log || tail -f /tmp/qemu3.log'
 # 3) 验收(宿主;期望 RESULT: pass=7 fail=0;IP 用 §5.4 的 docker inspect 结果)
 ./demo/zephyr_broker/accept.sh 172.17.0.2 1883
+# 3b) 功能测试套件(§9-13;宿主,自管 qemu 生命周期,期望 RESULT: pass=8 fail=0)
+python3 demo/zephyr_broker/function_test.py
+python3 demo/zephyr_broker/function_test.py --group ws_v5 -v      # 单组重跑
+python3 demo/zephyr_broker/function_test.py --no-manage --addr 172.17.0.2  # 复用已跑 broker
 # 4) 扩展场景(§9-4/6/7:容器内跑 python,宿主跑 curl)
 docker exec -d zephyr-tap python3 /workdir/nanomq/demo/zephyr_broker/hook_receiver.py \
     --port 18080 --out /tmp/webhook.log            # webhook 接收器(§9-4)
