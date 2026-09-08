@@ -107,3 +107,71 @@ Notes from bring-up that are easy to trip on again:
 * A SIGKILLed client's will is only published when the broker sees the
   socket close; `kill -9` the client itself, not a `timeout` wrapper
   around it.
+
+## Extended scenarios (session / keepalive / $SYS / REST / webhook)
+
+The acceptance script above covers the protocol surface; the scenarios
+below (verification record: `PORTING_ZEPHYR.md` §9-4/6/7/10) need packet
+control the mosquitto CLI does not give you (clean=0 without auto-reconnect,
+MQTT 5 session-expiry, arbitrary keepalive), so they are driven by
+[`mqtt_accept.py`](mqtt_accept.py) — a stdlib-only raw-socket MQTT 3.1.1/5
+client with machine-friendly `CONNACK/SUBACK/MSG/MATCH/EXIT` output:
+
+```sh
+# persistent session, MQTT 5, 30 s session-expiry: reconnect within the
+# window and the offline QoS1 message is delivered (session_present=1)
+python3 mqtt_accept.py 127.0.0.1 1883 sub --proto 5 --clean 0 --expiry 30 \
+    --topic v5/offline --qos 1 --expect v5-offline --hold 25
+# keepalive timeout: a silent client with --keepalive 2 is kicked after
+# ~5.6 s (1.5 x keepalive + the 1 s qos_duration tick); watch the broker
+# log or REST for the disconnect
+python3 mqtt_accept.py 127.0.0.1 1883 connect --keepalive 2 --hold 30
+# $SYS: subscribe from a second client to see the online/offline pair
+python3 mqtt_accept.py 127.0.0.1 1883 expect --topic '$SYS/brokers/client_status/#' \
+    --expect online --expect offline --hold 20
+```
+
+These need the demo's default build flags (`CONFIG_BROKER_REST_API`,
+`CONFIG_BROKER_WEBHOOK`, `CONFIG_BROKER_LOG_DEBUG`); the REST and webhook
+switches were added on top of the original demo to make the §9-4 path
+exercisable (Kconfig options wired to main.c overrides, see
+[Kconfig](Kconfig)).  The broker also overrides `qos_duration` to 1 s
+(conf default 10 s) so keepalive/session-expiry checks tick promptly.
+
+REST is served on `tcp:8081` (extra SLIRP hostfwd in
+[prj.conf](prj.conf)) with auth off:
+
+```sh
+curl -s localhost:8081/api/v4/clients     # note: top-level key is "data"
+```
+
+Webhook events are POSTed to the QEMU-host alias `10.0.2.2`.  Run
+[`hook_receiver.py`](hook_receiver.py) there before publishing to
+`test/#` to see them:
+
+```sh
+docker exec -d zephyr-tap python3 /workdir/nanomq/demo/zephyr_broker/hook_receiver.py \
+    --port 18080 --out /tmp/webhook.log
+```
+
+One event per connect (`client_connack` — clientid, proto_ver, keepalive)
+and one per `test/#` publish (`message_publish` — ts, topic, qos, payload).
+
+## Performance notes (qemu/SLIRP)
+
+Best-effort numbers (see PORTING_ZEPHYR.md §9-10 for the record):
+
+* QoS0 one-way forwarding reaches ~1.1-1.4 k msg/s with zero loss.
+* Request/response exchanges (QoS1 PUBACK, PINGREQ, SUBACK) cost a flat
+  ~110 ms each — Zephyr's TCP delayed-ACK (`ACK_DELAY = K_MSEC(100)`)
+  holds the ACK for ~100 ms on small segments.  This is a stack
+  characteristic, not a broker defect; QoS0 one-way throughput is
+  unaffected.
+* With `CONFIG_BROKER_LOG_DEBUG=y` the serial console becomes the
+  bottleneck (~380 log lines/s) and throughput drops to ~150-250 msg/s;
+  measure on a non-DEBUG build.
+
+SLIRP is a proxy network: absolute numbers need re-measuring on real
+hardware/network.  For the docker dev setup, MQTT/REST are reachable
+inside the `zephyr-tap` container (hostfwd binds in its namespace), not
+on the outer host.
