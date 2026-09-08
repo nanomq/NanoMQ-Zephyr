@@ -108,17 +108,17 @@ docker exec -u root zephyr-tap sh -lc '
     -m 32 -cpu qemu32,+nx,+pae,sse,sse2,pni -machine q35 \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 -no-reboot -machine acpi=off \
     -serial file:/tmp/qemu3.log -display none \
-    -netdev user,id=n1,hostfwd=tcp:0.0.0.0:1883-:1883,hostfwd=tcp:0.0.0.0:8081-:8081 \
+    -netdev user,id=n1,hostfwd=tcp:0.0.0.0:1883-:1883,hostfwd=tcp:0.0.0.0:8081-:8081,hostfwd=tcp:0.0.0.0:8083-:8083 \
     -device e1000,netdev=n1 \
     -kernel /workdir/build/zephyr_broker/zephyr/zephyr.elf &'
 ```
 
 (qemu is the SDK's hosttools build.  `west build -t run` is equivalent —
-the runner applies the `hostfwd` pair from [prj.conf](prj.conf)'s
+the runner applies the `hostfwd` triple from [prj.conf](prj.conf)'s
 `CONFIG_NET_QEMU_USER_EXTRA_ARGS` automatically — but keeps the serial
 console on stdio and occupies the terminal.  In the hand-launched form
-above both port forwards must be listed explicitly, exactly as here; the
-kernel path matches the `-d /workdir/build/zephyr_broker` of the Build
+above all three port forwards must be listed explicitly, exactly as here;
+the kernel path matches the `-d /workdir/build/zephyr_broker` of the Build
 step.)
 
 **Confirm the broker came up** — within a second or two the log shows the
@@ -154,19 +154,22 @@ outer host, python3 only inside the container:
 | `mosquitto_sub` / `mosquitto_pub`, `accept.sh` | outer host | `127.0.0.1:1883` via the socat forward below, or `<container-ip>:1883` |
 | `mqtt_accept.py`, `hook_receiver.py` | inside container | `127.0.0.1:1883`, `127.0.0.1:18080` |
 | REST `curl` | outer host | `http://127.0.0.1:8081` via the socat forward, or `http://<container-ip>:8081` |
+| MQTT over WebSocket (paho `transport="websockets"`, path `/mqtt`) | outer host | `ws://<container-ip>:8083/mqtt` |
+| `function_test.py` (whole suite) | outer host | manages qemu itself, targets `<container-ip>:1883/8081/8083` |
 
 ```sh
 docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' zephyr-tap   # → e.g. 172.17.0.2
 ```
 
 To use plain `localhost` from the outer host instead of the container IP,
-forward the two ports on the host (the container itself has no published
+forward the three ports on the host (the container itself has no published
 ports).  Needs socat; the forwards die with the host (or when the
 container IP changes) and are restarted the same way:
 
 ```sh
 socat TCP-LISTEN:1883,reuseaddr,fork,bind=127.0.0.1 TCP:172.17.0.2:1883 &
 socat TCP-LISTEN:8081,reuseaddr,fork,bind=127.0.0.1 TCP:172.17.0.2:8081 &
+socat TCP-LISTEN:8083,reuseaddr,fork,bind=127.0.0.1 TCP:172.17.0.2:8083 &
 ```
 
 ## Acceptance
@@ -231,7 +234,8 @@ exercisable (Kconfig options wired to main.c overrides, see
 [Kconfig](Kconfig)).  The broker also overrides `qos_duration` to 1 s
 (conf default 10 s) so keepalive/session-expiry checks tick promptly.
 
-REST is served on `tcp:8081` (second SLIRP hostfwd in [prj.conf](prj.conf))
+REST is served on `tcp:8081` (the second of the three SLIRP hostfwd entries
+in [prj.conf](prj.conf))
 with auth off.  curl exists on the outer host only — use the container IP
 (see the table in "Run"):
 
@@ -251,6 +255,64 @@ docker exec -d zephyr-tap python3 /workdir/nanomq/demo/zephyr_broker/hook_receiv
 One event per connect (`client_connack` — clientid, proto_ver, keepalive)
 and one per `test/#` publish (`message_publish` — ts, topic, qos, payload).
 
+## Functional test suite (`function_test.py`)
+
+[`function_test.py`](function_test.py) is the host-side end-to-end suite for
+this demo: it starts qemu itself (the same command as "Run" above, fresh
+serial log, waits for the broker banner), runs the groups below, and stops
+the broker again.  It is the Zephyr counterpart of
+`.github/scripts/test.py`, which cannot run here — that runner needs a host
+nanomq binary with TLS/WS listeners and drives host-only tooling
+(mosquitto CLI, TLS, auth).
+
+Run it from the repo root on the outer host:
+
+```sh
+python3 demo/zephyr_broker/function_test.py                  # all groups
+python3 demo/zephyr_broker/function_test.py --group ws_v5 -v # one group, show output
+python3 demo/zephyr_broker/function_test.py --no-manage --addr 172.17.0.2  # broker already up
+python3 demo/zephyr_broker/function_test.py --list           # groups + timeouts
+```
+
+| Group | What it drives | Driver |
+|---|---|---|
+| `mqtt_v311` | sessions, retain, v4/v5 interop | CI `mqtt_test.py` |
+| `mqtt_v5` | session expiry, user properties, `$share`, topic alias | CI `mqtt_test_v5.py` |
+| `rest_get` | REST GET surface on :8081 — 7 routes, plus `/configuration/websocket` mirroring the runtime WS conf | self-written |
+| `ws_v311` | MQTT 3.1.1 over `nmq-ws://` on :8083 | CI `ws_test.py` |
+| `ws_v5` | MQTT 5 over WS — properties, topic alias, session expiry | CI `ws_v5_test.py` |
+| `webhook_smoke` | `hook_receiver.py` receives `client_connack` + `message_publish` | self-written |
+| `capacity` | 12 concurrent CONNECTs + a QoS1 echo — regression for the connection-pool limit above | self-written |
+| `survival` | scaled-down `attack.py` load/session churn + post-churn echo probe | [`survival_test.py`](survival_test.py) |
+
+How the CI modules are reused without touching them: every group runs in its
+own subprocess (`--worker`), and the wrapper injects the broker address
+through each module's own seam — `g_addr`/`g_port`/`g_url` for the mqtt
+modules, a wrapped `Test.init` for `ws_test.py`, and
+`paho.mqtt.client.Client.connect` for `ws_v5_test.py` (which hardcodes
+`localhost:8083`).  The address reaches the subprocess via `ZF_ADDR`.
+
+Notes from bring-up:
+
+* The `.github/scripts/ws_v5_test.py` copy this tree carried was stale: it
+  set `MaximumPacketSize` (a CONNECT-only property) on the PUBLISH
+  properties, which paho 2.x rejects in the client thread — every v5
+  publisher died before it connected.  The file here is now upstream
+  master's version, which also bounds its waits instead of sleeping blindly.
+* The ws groups get one extra attempt by default (`--retry-ws`):
+  `ws_v5_test.py` uses fixed sleeps tuned for a host broker, and SLIRP
+  latency can make the first pass flaky.  Real jitter is recorded in
+  `PORTING_ZEPHYR.md` §9-13, not papered over.
+* `survival_test.py` scales `attack.py`'s constants down (30 s, 2 flood
+  publishers, 8 noise clients, 2-node share groups): the point is broker
+  liveness under churn on qemu, not throughput.  Host-side scale is a crash
+  amplifier — SLIRP forwards roughly 9 msg/s per connection.
+* Exit status: `0` all groups pass, `1` at least one failed, `2` structural
+  failure (docker/qemu/module prerequisites).  A failing group prints its
+  last 40 output lines plus the serial-log tail.
+
+Verification record: `PORTING_ZEPHYR.md` §9-13.
+
 ## Performance notes (qemu/SLIRP)
 
 Best-effort numbers (see PORTING_ZEPHYR.md §9-10 for the record):
@@ -264,6 +326,27 @@ Best-effort numbers (see PORTING_ZEPHYR.md §9-10 for the record):
 * With `CONFIG_BROKER_LOG_DEBUG=y` the serial console becomes the
   bottleneck (~380 log lines/s) and throughput drops to ~150-250 msg/s;
   measure on a non-DEBUG build.
+* Connection capacity is a **configuration** limit, not a network one.
+  Zephyr's defaults are sized for a sensor node: `CONFIG_NET_MAX_CONTEXTS=6`
+  (one context per socket) and `CONFIG_NET_MAX_CONN=8` leave only ~4 slots
+  once the three listeners (1883 + 8081 + 8083) exist.  When the pool is exhausted
+  Zephyr's TCP answers the next SYN with **RST** (`tcp.c` `tcp_conn_new()`:
+  `net_context_get()` fails → `net_tcp_reply_rst()`), which a client reports
+  as `Error: The connection was lost.` / "Connection reset by peer".
+  [prj.conf](prj.conf) raises both pools to 32 (plus the zvfs fd table and
+  the nng pollq's `poll()` event budget).  Measured before → after: 6
+  concurrent MQTT connects 2/6 → 6/6; 20 back-to-back connects at 50 ms
+  spacing 9/20 → 20/20; the `.github/scripts` v5 suite (`mqtt_test_v5.py`)
+  0/7 → 3/3 consecutive full passes.
+
+  A second, unrelated pool bites load tests: Zephyr allocates pthread
+  **rwlocks** from a fixed pool and nanolib takes one per topic-tree node
+  (`dbtree_node_new`/`dbtree_node_free`, `nanolib/mqtt_db.c` — paired, so
+  the live count tracks distinct subscribed topics).  The default 32 is
+  enough for the listeners but not for a flood over many topics: the
+  survival group reached `panic: pthread_rwlock_init: pool exhausted` at
+  ~30 topics, which aborts the guest (clients then see "Connection
+  refused").  [prj.conf](prj.conf) sets `CONFIG_MAX_PTHREAD_RWLOCK_COUNT=256`.
 
 SLIRP is a proxy network: absolute numbers need re-measuring on real
 hardware/network.  For the docker dev setup, MQTT/REST are reachable
