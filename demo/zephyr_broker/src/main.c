@@ -269,6 +269,16 @@ main(void)
 	nmq_conf->http_server.auth_type = NONE_AUTH;
 #endif
 
+#ifdef CONFIG_BROKER_WS
+	// WebSocket listener (MQTT over RFC6455, paho's default path /mqtt).
+	// broker() listens on websocket.url verbatim — the CONF_WS_URL_DEFAULT
+	// fallback lives in the broker_start*() file path, which this demo
+	// bypasses — so both fields must be set here.  TLS is compiled out of
+	// the Zephyr NanoNNG, so the wss: sibling listener stays inert.
+	nmq_conf->websocket.enable = true;
+	nmq_conf->websocket.url    = "nmq-ws://0.0.0.0:8083/mqtt";
+#endif
+
 #ifdef CONFIG_BROKER_WEBHOOK
 	// Webhook forwarder: broker pushes event JSON into the hook channel
 	// and a dedicated thread POSTs it to web_hook.url with the nng HTTP

@@ -27,4 +27,14 @@ config BROKER_WEBHOOK
 	  messages are POSTed to the receiver URL (guest reaches the QEMU host
 	  alias 10.0.2.2).  Run a receiver on that port before exercising it.
 
+config BROKER_WS
+	bool "Enable the WebSocket listener (MQTT over RFC6455, tcp:8083)"
+	help
+	  Sets conf websocket.enable / websocket.url in main.c so the broker
+	  also accepts MQTT over WebSocket on nmq-ws://0.0.0.0:8083/mqtt.
+	  Requires the mqttws transport in the NanoNNG build (enabled by this
+	  app's CMakeLists via NNG_TRANSPORT_MQTT_BROKER_WS=ON) and an extra
+	  SLIRP hostfwd for tcp:8083 (see prj.conf) to be reachable from the
+	  host.  TLS is built out of the Zephyr NanoNNG, so WSS stays inert.
+
 source "Kconfig.zephyr"
