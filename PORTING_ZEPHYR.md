@@ -144,9 +144,18 @@ core/file 增 `nni_file_exists/size` 中间层,公共 `nng.h` 暴露
 - 代码同步:`git submodule update --init nng`(锁定 `c66e0cb`)
 
 ### 5.2 构建
+在容器 `zephyr-tap` 内构建(仓库 bind 于 `/workdir/nanomq`,west 顶在
+`/workdir`;SDK/工具链只在容器里,宿主不可编译;`-u root` 因 bind 文件
+属主是宿主 uid 1001 而容器默认用户是 1000):
 ```sh
-west build -b qemu_x86 demo/zephyr_broker   # 输出 build/zephyr_broker/
+docker exec -u root zephyr-tap sh -lc '
+  cd /workdir/nanomq &&
+  git submodule update --init nng &&
+  ZEPHYR_TOOLCHAIN_VARIANT=zephyr ZEPHYR_SDK_INSTALL_DIR=/opt/toolchains/zephyr-sdk-1.0.1 \
+    west build -b qemu_x86 -d /workdir/build/zephyr_broker demo/zephyr_broker'
 ```
+普通(非容器)west workspace 同命令去掉两个环境变量即可;输出目录默认
+`build/zephyr_broker/`,本环境为 `/workdir/build/zephyr_broker/`。
 - NanoNNG 经 ExternalProject 编入 `build/zephyr_broker/nanonng_build/`
   (`cmake --build <dir> --target nng`),libnng.a 静态导入链接
 - 架构旗标(32 位 x86):`-march=i686 -mno-sse2/-sse3/-ssse3/-movbe`
@@ -171,12 +180,33 @@ CONFIG_BROKER_LOG_DEBUG=y                  # 调试用;正式运行可关
 ```
 
 ### 5.4 运行与 Zephyr 补丁
+杀旧实例与启动分两条独立 `docker exec`(`[i]` 括号防 pkill 自匹配,
+§7-5/8);串口日志在容器内 `/tmp/qemu3.log`:
 ```sh
-qemu-system-i386 -m 32 -cpu qemu32,+nx,+pae,sse,sse2,pni -machine q35 \
-  -no-reboot -machine acpi=off \
-  -netdev user,id=n1,hostfwd=tcp:0.0.0.0:1883-:1883 -device e1000,netdev=n1 \
-  -kernel build/zephyr_broker/zephyr/zephyr.elf
+docker exec -u root zephyr-tap pkill -f "qemu-system-[i]386" || true
+
+docker exec -u root zephyr-tap sh -lc '
+  /opt/toolchains/zephyr-sdk-1.0.1/hosttools/sysroots/x86_64-pokysdk-linux/usr/bin/qemu-system-i386 \
+    -m 32 -cpu qemu32,+nx,+pae,sse,sse2,pni -machine q35 \
+    -device isa-debug-exit,iobase=0xf4,iosize=0x04 -no-reboot -machine acpi=off \
+    -serial file:/tmp/qemu3.log -display none \
+    -netdev user,id=n1,hostfwd=tcp:0.0.0.0:1883-:1883,hostfwd=tcp:0.0.0.0:8081-:8081 \
+    -device e1000,netdev=n1 \
+    -kernel /workdir/build/zephyr_broker/zephyr/zephyr.elf &'
 ```
+**就绪判据**(`docker exec zephyr-tap tail -f /tmp/qemu3.log`):依次出现
+`rtc: CMOS clock … UTC, realtime seeded` → `net: ipv4 10.0.2.15` →
+`broker: NanoMQ (ver 0.25.1) Serving HTTP Server on http://(null):8081` →
+`NanoMQ Broker is started successfully!`。日志时间为**真实 UTC**(demo
+main.c 启动时从 QEMU CMOS RTC 播种 CLOCK_REALTIME,2026-09 修复;
+Zephyr 无 TZ 数据库,显示恒为 UTC,见 §8)。hostfwd 双端口(1883/8081)与
+prj.conf `CONFIG_NET_QEMU_USER_EXTRA_ARGS` 一致 —— `west build -t run`
+会自动带上,手动 qemu 必须显式列出,漏 8081 则 REST(§9-4)不通。
+客户端落点:宿主 mosquitto/accept.sh → 容器 IP(`docker inspect -f
+'{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' zephyr-tap`,
+实测 172.17.0.2):1883,或经宿主 socat 转发用 127.0.0.1(命令见 demo
+README);容器内 python(mqtt_accept.py/hook_receiver.py) → 127.0.0.1;
+宿主 curl → 容器 IP:8081(容器内无 mosquitto/curl)。
 **必需环境补丁(RCTL_BAM)**:QEMU e1000 设备模型复位后清零 RCTL(真实硬件
 默认置位 BAM=bit15),Zephyr `eth_e1000` 驱动从不置 BAM → **所有广播帧
 (ARP!)被模型静默丢弃**,SLIRP 永远无法完成首个 TCP 连接。
@@ -251,7 +281,10 @@ iow32(dev, RCTL, RCTL_EN | RCTL_MPE | RCTL_BAM | DT_INST_PROP(inst, rdmts) << RD
 
 ## 8. 局限与已知取舍
 - 线程模型:nng 平台 poller/taskq + POSIX 动态线程池上限 16(`CONFIG_POSIX_THREAD_THREADS_MAX`),broker 连接并发受其约束;栈 16 KB/线程
-- 时间戳:guest 日志 `1970-01-01 00:00:xx`(Zephyr 无 RTC),只可相对参考
+- 时间戳:guest 日志已从 2026-09 起为真实 UTC —— demo main.c 启动时读
+  QEMU CMOS RTC(默认 `-rtc base=utc`)播种 `CLOCK_REALTIME`(lib/os/clock.c
+  的 offset+uptime 模型,播种后持续走时);Zephyr 无 TZ 数据库,显示恒为
+  UTC;真实板卡需自行接 RTC/时区处理
 - 无文件系统:配置/日志/持久会话均无落盘;`$SYS` 只服务运行时
 - 目标板:qemu_x86(32 位)验证;同 ExternalProject 已含 32 位 ARM 原子回退
   (`NNG_ZEPHYR_NO_STDATOMIC`),但**未在真实板卡验证**(网络驱动、中断、内存
@@ -260,7 +293,8 @@ iow32(dev, RCTL, RCTL_EN | RCTL_MPE | RCTL_BAM | DT_INST_PROP(inst, rdmts) << RD
 
 ## 9. 移植功能清单与验证状态(2026-09 复核)
 
-验证环境:qemu_x86 同一镜像(guest 日志时间为 1970 纪元,仅可相对参考)。
+验证环境:qemu_x86 同一镜像(demo 已从 QEMU CMOS RTC 播种真实时钟,
+日志为 UTC,§5.4)。
 扩展场景由 demo 验收工具(commit `bd96660af`)驱动:`mqtt_accept.py` 在
 qemu 容器内连 `127.0.0.1:1883`(SLIRP hostfwd 在容器命名空间内),
 REST 走 `:8081`,webhook 接收器 `hook_receiver.py` 挂在 10.0.2.2 别名
@@ -323,16 +357,21 @@ REST 走 `:8081`,webhook 接收器 `hook_receiver.py` 挂在 10.0.2.2 别名
     - SLIRP 是代理网络,qemu 数值与真实网络/板卡不可比 —— 数据面结论
       需在真实网络/板卡上复测(§8-9)
 
-## 10. 复现命令速查
+## 10. 复现命令速查(容器环境 `zephyr-tap`,§5.1)
 ```sh
-# 1) 打 Zephyr 补丁(§5.4,2 行)  # 2) 构建
-west build -b qemu_x86 demo/zephyr_broker
-# 3) 运行(qemu 命令见 §5.4)      # 4) 验收
-./demo/zephyr_broker/accept.sh 127.0.0.1 1883     # 期望 RESULT: pass=7 fail=0
-# 5) 扩展场景(§9-4/6/7;qemu 在容器内时端口在容器命名空间)
+# 0) 打 Zephyr 补丁(§5.4 两行,改 /workdir/zephyr 内树,须 -u root)
+# 1) 构建(§5.2 全文;镜像 zephyr-build:main 已含 SDK/工具链)
+docker exec -u root zephyr-tap sh -lc 'cd /workdir/nanomq && ZEPHYR_TOOLCHAIN_VARIANT=zephyr \
+  ZEPHYR_SDK_INSTALL_DIR=/opt/toolchains/zephyr-sdk-1.0.1 \
+  west build -b qemu_x86 -d /workdir/build/zephyr_broker demo/zephyr_broker'
+# 2) 启动(先 pkill 旧实例再启动,命令全文见 §5.4);就绪判据:
+docker exec zephyr-tap sh -lc 'grep -a "NanoMQ Broker is started" /tmp/qemu3.log || tail -f /tmp/qemu3.log'
+# 3) 验收(宿主;期望 RESULT: pass=7 fail=0;IP 用 §5.4 的 docker inspect 结果)
+./demo/zephyr_broker/accept.sh 172.17.0.2 1883
+# 4) 扩展场景(§9-4/6/7:容器内跑 python,宿主跑 curl)
 docker exec -d zephyr-tap python3 /workdir/nanomq/demo/zephyr_broker/hook_receiver.py \
     --port 18080 --out /tmp/webhook.log            # webhook 接收器(§9-4)
-python3 demo/zephyr_broker/mqtt_accept.py 127.0.0.1 1883 sub --proto 5 \
-    --clean 0 --expiry 30 --topic v5/offline --qos 1    # 离线会话(§9-6②)
-curl -s localhost:8081/api/v4/clients              # REST(§9-4;键为 data)
+docker exec zephyr-tap python3 /workdir/nanomq/demo/zephyr_broker/mqtt_accept.py 127.0.0.1 1883 \
+    sub --proto 5 --clean 0 --expiry 30 --topic v5/offline --qos 1   # 离线会话(§9-6②)
+curl -s http://172.17.0.2:8081/api/v4/clients      # REST(§9-4;键为 data)
 ```

@@ -18,15 +18,172 @@
 #include <zephyr/sys/printk.h>
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/net_core.h>
+#include <zephyr/sys/clock.h>
 
 #include "nng/nng.h"
 #include "nng/supplemental/nanolib/conf.h"
 #include "nng/supplemental/nanolib/log.h"
 #include "mqtt_api.h" // log_init(conf_log *)
 
+#if defined(CONFIG_X86)
+#include <time.h>              // time_t
+#include <zephyr/sys/sys_io.h> // io_port_t
+#include <zephyr/arch/x86/arch.h> // sys_in8()/sys_out8()
+#endif
+
 // broker() lives in nanomq/nanomq/apps/broker.c and is not declared in
 // broker.h (which only exports broker_start/broker_start_with_conf).
 extern int broker(conf *nanomq_conf);
+
+#if defined(CONFIG_X86)
+//
+// Seed CLOCK_REALTIME from the QEMU-emulated mc146818 (CMOS) RTC.
+//
+// Zephyr has no timeprovider wired to the PC CMOS RTC, so CLOCK_REALTIME
+// starts at the 1970 epoch and nanolib's log timestamps (log.c formats
+// time(NULL) with localtime_r) print "1970-01-01 00:00:xx + uptime".
+// QEMU's q35 chipset emulates the standard CMOS RTC at I/O ports 0x70/0x71
+// and seeds it with the host clock at launch (default `-rtc base=utc`),
+// so reading it once at boot and handing it to sys_clock_settime() gives
+// real timestamps from then on (lib/os/clock.c: realtime = offset+uptime,
+// so the clock keeps tracking without further updates).
+//
+
+#define CMOS_PORT_IDX   0x70U
+#define CMOS_PORT_DAT   0x71U
+#define CMOS_REG_SEC    0x00U
+#define CMOS_REG_MIN    0x02U
+#define CMOS_REG_HOUR   0x04U
+#define CMOS_REG_DAY    0x07U
+#define CMOS_REG_MON    0x08U
+#define CMOS_REG_YEAR   0x09U
+#define CMOS_REG_STAT_A 0x0AU
+#define CMOS_REG_STAT_B 0x0BU
+#define CMOS_UIP_BIT    0x80U /* STAT_A: update in progress */
+#define CMOS_24H_BIT    0x02U /* STAT_B: 0 = 12 h mode */
+#define CMOS_BIN_BIT    0x04U /* STAT_B: 0 = BCD, 1 = binary */
+
+static uint8_t
+cmos_read(uint8_t reg)
+{
+	// Bit 7 of the index byte disables NMI while addressing the RTC.
+	sys_out8((uint8_t) (reg | 0x80U), CMOS_PORT_IDX);
+	return sys_in8(CMOS_PORT_DAT);
+}
+
+static uint8_t
+cmos_bcd2bin(uint8_t v)
+{
+	return (uint8_t) (((v >> 4) & 0x0FU) * 10U + (v & 0x0FU));
+}
+
+// days_from_civil(): Howard Hinnant's algorithm, proleptic Gregorian —
+// avoids libc mktime()/TZ involvement (the CMOS clock is UTC).
+static int64_t
+days_from_civil(int64_t y, unsigned m, unsigned d)
+{
+	int64_t era;
+	unsigned yoe, doe, doy;
+
+	y -= (m <= 2U);
+	era = (y >= 0 ? y : y - 399) / 400;
+	yoe = (unsigned) (y - era * 400);
+	doy = (153U * (m + (m > 2U ? -3U : 9U)) + 2U) / 5U + d - 1U;
+	doe = yoe * 365U + yoe / 4U - yoe / 100U + doy;
+
+	return era * 146097 + (int64_t) doe - 719468;
+}
+
+static int
+cmos_read_datetime(uint8_t *secp, uint8_t *minp, uint8_t *hourp, uint8_t *dayp,
+    uint8_t *monp, uint8_t *yearp)
+{
+	uint8_t s1, s2;
+	int     i;
+
+	// Re-read until the seconds register is stable across the whole
+	// read (the RTC updates once per second; reads must not straddle it).
+	for (i = 0; i < 8; i++) {
+		s1    = cmos_read(CMOS_REG_SEC);
+		*minp = cmos_read(CMOS_REG_MIN);
+		*hourp = cmos_read(CMOS_REG_HOUR);
+		*dayp = cmos_read(CMOS_REG_DAY);
+		*monp = cmos_read(CMOS_REG_MON);
+		*yearp = cmos_read(CMOS_REG_YEAR);
+		s2    = cmos_read(CMOS_REG_SEC);
+		if (s1 == s2) {
+			*secp = s1;
+			return (0);
+		}
+	}
+
+	return (-1);
+}
+
+static void
+seed_realtime_from_cmos(void)
+{
+	struct timespec ts;
+	uint8_t sec, min, hour, day, mon, year, stat_b;
+	bool binary, h24;
+	unsigned tries, y_full;
+	int64_t epoch;
+
+	// Wait out any update-in-progress cycle before touching the regs.
+	for (tries = 0; tries < 1000; tries++) {
+		if ((cmos_read(CMOS_REG_STAT_A) & CMOS_UIP_BIT) == 0U) {
+			break;
+		}
+	}
+	if (cmos_read_datetime(&sec, &min, &hour, &day, &mon, &year) != 0) {
+		printk("rtc: CMOS read straddled an update, keeping 1970 epoch\n");
+		return;
+	}
+	stat_b = cmos_read(CMOS_REG_STAT_B);
+	binary = (stat_b & CMOS_BIN_BIT) != 0;
+	h24    = (stat_b & CMOS_24H_BIT) != 0;
+
+	if (!binary) {
+		sec  = cmos_bcd2bin(sec);
+		min  = cmos_bcd2bin(min);
+		hour = cmos_bcd2bin(hour);
+		day  = cmos_bcd2bin(day);
+		mon  = cmos_bcd2bin(mon);
+		year = cmos_bcd2bin(year);
+	}
+	if (!h24) {
+		// 12 h mode: bit 7 of the hour register means PM.
+		bool pm = (hour & 0x80U) != 0;
+
+		hour &= 0x7FU;
+		if (pm) {
+			if (hour != 12U) {
+				hour += 12U;
+			}
+		} else if (hour == 12U) {
+			hour = 0;
+		}
+	}
+
+	// Sanity checks: 2-digit year mapped onto 1970-2069, valid date.
+	y_full = (year >= 70U) ? (1900U + year) : (2000U + year);
+	if (y_full < 2000U || y_full > 2099U || mon < 1U || mon > 12U ||
+	    day < 1U || day > 31U || hour > 23U || min > 59U || sec > 59U) {
+		printk("rtc: CMOS time out of range (%04u-%02u-%02u %02u:%02u:%02u)\n",
+		    y_full, mon, day, hour, min, sec);
+		return;
+	}
+	epoch = days_from_civil(y_full, mon, day) * 86400 +
+	    hour * 3600 + min * 60 + sec;
+
+	ts.tv_sec  = (time_t) epoch;
+	ts.tv_nsec = 0;
+	(void) sys_clock_settime(SYS_CLOCK_REALTIME, &ts);
+
+	printk("rtc: CMOS clock %04u-%02u-%02u %02u:%02u:%02u UTC, realtime seeded\n",
+	    y_full, mon, day, hour, min, sec);
+}
+#endif // CONFIG_X86
 
 static void
 dump_iface_ipv4_cb(struct net_if *iface, struct net_if_addr *ifaddr, void *user_data)
@@ -71,6 +228,12 @@ void
 main(void)
 {
 	conf *nmq_conf;
+
+#if defined(CONFIG_X86)
+	// Real wall clock before the broker (and nanolib log_init) starts
+	// printing timestamps.
+	seed_realtime_from_cmos();
+#endif
 
 	if ((nmq_conf = nng_zalloc(sizeof(conf))) == NULL) {
 		printk("Cannot allocate configuration, quit\n");
