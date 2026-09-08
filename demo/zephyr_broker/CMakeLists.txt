@@ -88,6 +88,14 @@ set(NNG_EXTRA_ARGS
 # on it and nanolib log.h compiles log_*() to no-ops without it — a
 # libnng built without ENABLE_LOG leaves conf->log.type unset (broker
 # logging dead) even though the app side defines it.
-set(NNG_EXTRA_CFLAGS -DENABLE_LOG)
+#
+# ACL_SUPP likewise gates the conf_acl fields of struct conf
+# (conf.h: #ifdef ACL_SUPP → conf_acl acl / acl_nomatch / acl_deny_action,
+# 20 bytes).  It is defined on the app side above, so the conf.c compiled
+# into libnng MUST see it too, or struct conf layouts disagree between
+# libnng and the broker .c files — auth_http lands 20 bytes early in
+# libnng's view and start_rest_server() locks a garbage
+# auth_http.acl_cache_mtx (pthread_mutex_lock: Invalid argument → nni_panic).
+set(NNG_EXTRA_CFLAGS "-DENABLE_LOG -DACL_SUPP")
 
 include(../cmake/nanonng_external.cmake)

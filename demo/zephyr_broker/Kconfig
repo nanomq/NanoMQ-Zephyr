@@ -12,4 +12,19 @@ config BROKER_LOG_DEBUG
 	  MQTT session flow is visible on the console.  Disable for normal
 	  runs (less noise, fewer cycles in log formatting).
 
+config BROKER_REST_API
+	bool "Enable the NanoMQ REST API (HTTP tcp:8081, auth off)"
+	help
+	  Sets conf http_server.enable / auth_type=NONE_AUTH in main.c so the
+	  broker serves /api/v4 over plain HTTP.  Requires an extra SLIRP
+	  hostfwd for tcp:8081 (see prj.conf) to be reachable from the host.
+
+config BROKER_WEBHOOK
+	bool "Enable the NanoMQ webhook forwarder (POST to conf->web_hook.url)"
+	help
+	  Sets conf web_hook.enable, an inproc hook channel (Zephyr has no IPC
+	  transport) and one MESSAGE_PUBLISH rule on "test/#" so published
+	  messages are POSTed to the receiver URL (guest reaches the QEMU host
+	  alias 10.0.2.2).  Run a receiver on that port before exercising it.
+
 source "Kconfig.zephyr"
