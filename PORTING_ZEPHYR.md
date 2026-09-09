@@ -467,3 +467,56 @@ docker exec zephyr-tap python3 /workdir/nanomq/demo/zephyr_broker/mqtt_accept.py
     sub --proto 5 --clean 0 --expiry 30 --topic v5/offline --qos 1   # 离线会话(§9-6②)
 curl -s http://172.17.0.2:8081/api/v4/clients      # REST(§9-4;键为 data)
 ```
+
+---
+
+## §22 ESP32-S3 实机 bring-up(demo/nanomq_esp32s3_broker)
+
+实机:ESP32-S3-LCD-EV-Board(N16R16V,16 MB flash + 16 MB octal PSRAM),
+宿主 Fedora + `esp-zephyr` 环境,`west flash` + idf-monitor。验证记录
+2026-09-09。
+
+### §22-1 已通过
+
+- PSRAM 16 MB octal 识别 + memory test(80 MHz);构建/烧录/串口无碍。
+- Wi-Fi STA(DHCP):`wifi: connected` → `net: ipv4 192.168.1.10`。
+- broker banner + REST :8081 可达(host curl)。
+- 无 RTC,日志时间戳恒为 1970-01-01(已知外观,非缺陷)。
+
+### §22-2 bring-up 修掉的坑(均落 repo/子模块)
+
+- **blob 缺失**:`west blobs fetch hal_espressif` 不跑则 `WIFI_ESP32` 静默隐藏。
+- **`CONFIG_WIFI` 伞开关**:只设 `WIFI_ESP32=y` 无效。
+- **ExternalProject 不重编**:nng 源改动不触发 rebuild(曾连续数版跑旧
+  libnng.a)→ `BUILD_ALWAYS TRUE`。
+- **xtensa**:`-mno-movbe` 仅 x86;32 位非 x86 全部要 `NNG_ZEPHYR_NO_STDATOMIC`
+  (链接期 `__sync_*_8` 未解析)。
+- **net_mgmt 事件**:不同 layer-code 的事件 OR 进一个 mask 会被
+  `mgmt_run_slist_callbacks` 整条丢弃(等值比较)→ 每事件单独回调。
+- **STA 驱动默认**:`WIFI_STA_AUTO_DHCPV4`(驱动自起 DHCP、不发
+  CONNECT_RESULT)与自动重连会与 app 侧连接流程打架 → prj.conf 显式关。
+- **shared_multi_heap 非线程安全**(裸 sys_heap 无锁)→ nng 分配器改
+  `k_heap` 托管 PSRAM 窗(nng 子模块 `zephyr_alloc.c`,
+  `NNG_ZEPHYR_ALLOC_SMH` 分支)。
+- **SRAM 预算**:整包 broker 数据面必须进 PSRAM;`ESP_SPIRAM_BSS_RELOC`
+  搬 posix 池/net_buf;内核堆池 192 KB 留 picolibc 裸 malloc 余量
+  (dram0_0_seg 77 %)。
+
+### §22-3 未决(上游,阻塞 MQTT 客户端验收)
+
+**现象**:首个 MQTT 客户端 CONNECT(纯订阅亦可)确定性写穿 PSRAM 堆 →
+`heap canary: corruption` / `double free` panic(EXTREME 下
+`heap validation failed`,alloc size 1)。
+
+**取证**(已确认与 Zephyr 集成无关):
+- 被写穿对象 = topic 树路径上的小层缓冲(5 B `$SYS`/`test` 等,
+  由 `mqtt_db.c topic_parse()` 按 `层长+1` 分配);损坏为 chunk 尾 canary。
+- 排除:REST 开关、$SYS client_status 通知(源码级旁路后仍崩)、
+  分配器(smh vs k_heap)、堆加固等级、是否有订阅、qemu 侧长期套件不现。
+- 怀疑:上游 dbtree/路由对 topic 层缓冲存在越界写(时机/堆布局决定
+  是否炸;qemu libc 堆恰好不炸)。现场日志与逐操作堆轨迹
+  (`zephyr_alloc.c` 环形 + heap.c 挂载均已在收尾时清除)见会话记录。
+
+**建议**:在上游 nng(nanolib/mqtt db)修 topic 层缓冲越界后再跑实机
+`function_test.py --no-manage --addr <板IP>`(mqtt_v311/mqtt_v5/rest_get);
+当前 demo 仅验证到 §22-1。
