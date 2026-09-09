@@ -39,10 +39,12 @@ if(CONFIG_X86 AND NOT CONFIG_64BIT)
     # Safe default: i686 has cmpxchg8b
     set(arch_flags "-march=i686")
   endif()
-elseif(CONFIG_ARM AND NOT CONFIG_64BIT)
-  # 32-bit ARM: __sync_*_8 emits libatomic calls that are unresolved
-  # on bare-metal. Use the pthread-mutex atomic fallback instead.
-  # AArch64 (ARM 64-bit) has native 64-bit atomics and is unaffected.
+elseif(NOT CONFIG_64BIT AND NOT CONFIG_X86)
+  # Any 32-bit non-x86 target (ARM, RISC-V, Xtensa/esp32s3, ...):
+  # __sync_*_8 emits calls its libatomic cannot resolve on bare-metal
+  # (xtensa-esp32s3: undefined __sync_fetch_and_add_8 at link).  Use the
+  # pthread-mutex atomic fallback instead.  x86_32 has cmpxchg8b; 64-bit
+  # targets have native 64-bit atomics — both unaffected.
   list(APPEND NNG_EXTRA_ARGS -DNNG_ZEPHYR_NO_STDATOMIC=ON)
 endif()
 
@@ -68,9 +70,15 @@ set(NNG_ROOT ${NNG_ROOT})  # ensure it's visible in this scope
 
 # Zephyr's qemu_x86/atom SoC enables "-march=atom" which includes "movbe"
 # (Move Big-Endian).  QEMU's "-cpu qemu32" does NOT support movbe and
-# raises #UD when it hits one.  -mno-movbe is a no-op on non-x86.
+# raises #UD when it hits one — so x86 builds get -mno-movbe.  Other
+# targets (e.g. xtensa esp32s3) must NOT see it: their gcc rejects the
+# option outright.
+set(mno_movbe "")
+if(CONFIG_X86)
+  set(mno_movbe " -mno-movbe")
+endif()
 set(external_cflags
-  "${includes} ${system_includes} ${definitions} ${options} ${arch_flags} ${build_includes_str} -DNDEBUG ${NNG_EXTRA_CFLAGS} -mno-movbe")
+  "${includes} ${system_includes} ${definitions} ${options} ${arch_flags} ${build_includes_str} -DNDEBUG ${NNG_EXTRA_CFLAGS}${mno_movbe}")
 
 # ── ExternalProject ──────────────────────────────────────────────
 include(ExternalProject)
@@ -103,6 +111,12 @@ ExternalProject_Add(nanonng
     -DNNG_MAX_POLLER_THREADS=1
     -DNNG_MAX_EXPIRE_THREADS=1
     ${NNG_EXTRA_ARGS}
+  # Source edits inside the nng tree do not bump ExternalProject stamps,
+  # so without this a changed zephyr_alloc.c etc. silently stays unbuilt
+  # (observed: stale libnng.a served for several demo builds).  With
+  # BUILD_ALWAYS the sub-build runs each time and ninja no-ops when
+  # nothing changed.
+  BUILD_ALWAYS TRUE
   BUILD_COMMAND     ${CMAKE_COMMAND} --build <BINARY_DIR> --target nng
   INSTALL_COMMAND   ""
   BUILD_BYPRODUCTS  <BINARY_DIR>/libnng.a
