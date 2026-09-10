@@ -267,7 +267,11 @@ webhook_msg_publish(nng_socket *sock, conf_web_hook *hook_conf,
 
 	int rv = nng_send(*sock, json, strlen(json), NNG_FLAG_NONBLOCK);
 
-	nng_strfree(json);
+	// cJSON allocates with the libc allocator (its default hooks): free it
+	// with the matching cJSON_free, NOT nng_strfree — mixing families is
+	// harmless when the nng allocator is also libc malloc (posix builds),
+	// but corrupts the heap on ports where it isn't (Zephyr/PSRAM).
+	cJSON_free(json);
 	cJSON_Delete(obj);
 
 	return rv;
@@ -298,7 +302,11 @@ webhook_client_connack(nng_socket *sock, conf_web_hook *hook_conf,
 
 	int rv = nng_send(*sock, json, strlen(json), NNG_FLAG_NONBLOCK);
 
-	nng_strfree(json);
+	// cJSON allocates with the libc allocator (its default hooks): free it
+	// with the matching cJSON_free, NOT nng_strfree — mixing families is
+	// harmless when the nng allocator is also libc malloc (posix builds),
+	// but corrupts the heap on ports where it isn't (Zephyr/PSRAM).
+	cJSON_free(json);
 	cJSON_Delete(obj);
 
 	return rv;
@@ -327,7 +335,11 @@ webhook_client_disconnect(nng_socket *sock, conf_web_hook *hook_conf,
 
 	int rv = nng_send(*sock, json, strlen(json), NNG_FLAG_NONBLOCK);
 
-	nng_strfree(json);
+	// cJSON allocates with the libc allocator (its default hooks): free it
+	// with the matching cJSON_free, NOT nng_strfree — mixing families is
+	// harmless when the nng allocator is also libc malloc (posix builds),
+	// but corrupts the heap on ports where it isn't (Zephyr/PSRAM).
+	cJSON_free(json);
 	cJSON_Delete(obj);
 
 	return rv;
