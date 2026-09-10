@@ -113,21 +113,21 @@ and no time source is wired (cosmetic).
   * wifi driver bring-up knobs in prj.conf comments (STA auto-DHCP /
     auto-reconnect interplay with an app-side connect flow).
 
-## Known issue — client CONNECT/SUBSCRIBE heap corruption (upstream)
+## Known issue — client CONNECT still fails (open)
 
-**Status: still open, upstream nanolib/broker code.**  The first MQTT
-client CONNECT (and SUBSCRIBE alone) deterministically overruns a
-heap object in the topic-tree path and panics the PSRAM heap
-(`heap canary: corruption` / `double free` at a small topic-level
-allocation, e.g. a 5-byte `$SYS`/`test` level buffer).  It is unrelated
-to this demo's Zephyr integration: reproduced with REST on/off, with
-the $SYS client_status notifications disabled, with both allocator
-flavours (smh and k_heap) and both heap hardening levels; the qemu
-demo's libc heap layout simply does not trip it.
+**Status: partially fixed, one item open.**  Client CONNECT crashed the
+broker in the PSRAM heap.  Root cause (2026-09-10) was a family of
+**allocator-family mismatches** in nanolib/nanomq: objects allocated with
+the nng allocator but freed with libc `free()` (or the reverse).  That is
+invisible upstream — POSIX nng's allocator *is* libc malloc — but on this
+port the nng allocator is the PSRAM k_heap, so each mismatch corrupts one
+of the two heaps.  Fixed here: mqtt_db.c / hash_table.c / mqtt_parser.c
+(nng 80cf26b) and webhook_post.c (nanomq 84fd90f6).
 
-Forensic record (heap-op trace around the corrupted chunk, crash
-signatures, eliminations) is in `PORTING_ZEPHYR.md` §7-22.  Until the
-upstream root cause is fixed the demo is verified for
-build/flash/boot/serve — MQTT client traffic on this board still
-crashes the broker.  Re-verify against a fixed nng/nanomq upstream
-before claiming end-to-end MQTT acceptance.
+Remaining: the CONNECT `client_status` event is processed **twice** on
+Zephyr, so the same `pub_packet` is torn down twice
+(`server_cb → free_pub_packet → k_heap_free`, wild write).  Host builds
+take a single pass (hence clean ASAN/glibc runs).  Forensics and next
+steps: PORTING_ZEPHYR.md §22-3(b).  Until that path is fixed, MQTT
+client traffic on this board still panics the broker; build/flash/boot/
+Wi-Fi/DHCP/REST are verified.
