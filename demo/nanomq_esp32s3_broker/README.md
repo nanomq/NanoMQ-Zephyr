@@ -113,23 +113,26 @@ and no time source is wired (cosmetic).
   * wifi driver bring-up knobs in prj.conf comments (STA auto-DHCP /
     auto-reconnect interplay with an app-side connect flow).
 
-## Known issue — client CONNECT still fails (open)
+## Verified on hardware — full MQTT surface (2026-09-10)
 
-**Status: partially fixed, one item open.**  Client CONNECT crashed the
-broker in the PSRAM heap.  Root cause (2026-09-10) was a family of
-**allocator-family mismatches** in nanolib/nanomq: objects allocated with
-the nng allocator but freed with libc `free()` (or the reverse).  That is
-invisible upstream — POSIX nng's allocator *is* libc malloc — but on this
-port the nng allocator is the PSRAM k_heap, so each mismatch corrupts one
-of the two heaps.  Fixed here: mqtt_db.c / hash_table.c / mqtt_parser.c
-(nng 80cf26b) and webhook_post.c (nanomq 84fd90f6).
+Client traffic now passes on the ESP32-S3-LCD-EV-Board:
 
-Remaining (2026-09-10, second forensics round): the event flow is
-single-pass (probe-verified), all allocator-family mismatches are gone
-(bidirectional cross-free detectors return zero), and the crash is a
-corrupted k_heap free-list bucket in the event encode/free sequence on
-32-bit targets (qemu_x86 + xtensa both crash; host ASAN/glibc and the
-qemu libc-malloc branch do not; Zephyr's own tests/lib/heap passes on
-qemu_x86).  See PORTING_ZEPHYR.md §22-3(b) for the gdb evidence chain
-and next steps.  Until that is fixed, MQTT client traffic on this board
-still panics the broker; build/flash/boot/Wi-Fi/DHCP/REST are verified.
+* MQTT v3.1.1 QoS 0/1/2 publish→subscribe round trips, retained
+  messages, REST API, and connect/disconnect churn all verified with
+  mosquitto against the board at `192.168.1.10`.
+* The earlier client-CONNECT heap corruption was an **allocator-family
+  mismatch** in the MQTT codec (`mqtt_codec.c` freed `nni_zalloc`'d
+  proto-data/properties with libc `free()`, plus two `nng_zalloc` ↔
+  `free` sites in `mqtt_qos_db.c`) — invisible upstream where the nng
+  allocator *is* libc malloc, corrupting both heaps here.  Fixed in
+  nng `cb34268`, bumped by nanomq `7ae89a2b`; full forensic record in
+  PORTING_ZEPHYR.md §22-3(b).
+* Companion fixes on the way: nanolib topic-queue pairing (nng
+  `80cf26b`), webhook cJSON free (nanomq `84fd90f6`).
+
+Run the suite against the board with:
+
+```sh
+python3 demo/zephyr_broker/function_test.py --no-manage --addr <board-ip> \
+    --group mqtt_v311 --group mqtt_v5 --group rest_get
+```

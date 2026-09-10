@@ -518,24 +518,35 @@ curl -s http://172.17.0.2:8081/api/v4/clients      # REST(§9-4;键为 data)
 `--wrap=free` 正向探针 + `nni_free` 反向探针 + 逐操作堆校验环 +
 zfree 调用点探针;主机 ASAN 与上游同负载全绿用于排除共享代码。
 
-**(b) 剩余未决——k_heap 自由链损坏(证据已到帧级,2026-09-10 二轮取证)**:
-qemu(SMH 版)gdb 全程追踪结论:
-- **事件流单轮**(work 级探针 PRECV/PCONN/PNOT/PSENDF 每次连接各一次,
-  "双轮"假说被证伪);每连接两条 `online!` 日志 = demo main.c 在
-  `log_init()`(其内部已按 conf 注册 console)后又 `log_add_console()`
-  一次,两个 sink 各打一行——显示瑕疵,非崩溃因。
-- 家族错配双向探测器(wrap free + nni_free 窗口外检测)归零——修复完成。
-- 崩溃点:`free(块A)` 内 `set_prev_free_chunk(second)`,second 由 bucket
-  链读出且已是数据值 0x1ff8138d → 野写 0xffdd32c4。即**自由链表
-  bucket->next 被污染**;msg `m_refcnt` 在 encode 时=1(非 UAF 编码);
-  awatch 各队列数组只见合法访问。
-- 环境矩阵:qemu_x86 + k_heap 崩、xtensa S3 崩、Zephyr 官方
-  `tests/lib/heap`(qemu_x86)全过、host ASAN/glibc 与 qemu-libc-malloc
-  分支均不现 → 32 位 k_heap 与该事件编码/释放序列(小块高频
-  split/复用)交互缺陷,宿主侧不可复现。
-- 已试 workaround 并回退:mqtt_db 队列族 libc 化(与 parser/hash_table
-  同族)后 qemu 仍崩 → 布局无关,需在 free 前逐次 validate 锁内定位
-  第一坏点,或与 NanoNNG/Zephyr 上游比对 k_heap 特殊序列。
+**(b) 根因定位与修复(2026-09-10 终局)**
+
+真凶:**`mqtt_codec.c` 的 MQTT 协议层把 `NNI_ALLOC_STRUCT`/`property_alloc`
+(nni_zalloc → PSRAM)分配的对象用裸 libc `free()` 释放**(4 处:proto_data
+结构 + 三处 property);`mqtt_qos_db.c` 另有两处 `nng_zalloc` ↔ `free`。
+上游 POSIX 两族同堆故无感;移植后 libc free 把 PSRAM 指针当成自家块——
+既污染 libc arena 的 bucket,又把 libc 链表指针写进 PSRAM 块负载;当该块
+正挂在 k_heap 空闲链上(payload 首部即 FREE_NEXT/FREE_PREV),下一次分配
+走到被毒化的 bucket → `set_prev_free_chunk` 野写(0x1ff8138d 之类的数据值)。
+这解释了此前全部现象:每连接必崩(编解码每条消息都走)、
+`$SYS`/主题层 5 字节小块被反复点名、双堆(PSRAM + 内核堆)先后告警。
+
+定位方法(决定性的一步):在 nng Zephyr 分配器里做**锁内逐操作
+`sys_heap_validate`**(拿 k_heap 自身 spinlock,排除并发假阳性)+
+最近 32 次操作环形记录(含调用方地址)。首个失败操作的精确定位:
+`nni_msg_free:483 → nni_mqtt_msg_free:451 free(mqtt)`;EXTREME canary
+下同一调用链在 libc 侧以"canary: corruption"复现。交叉验证:
+qemu(k_heap 经我们的 PSRAM 分配器)修复后全流程通过,上游 host ASAN
+与 qemu libc-malloc 分支始终干净(因为两族同堆,这个 bug 在那里不存在)。
+
+修复:nng commit `cb34268`(mqtt_codec 4 处 + qos_db 2 处),
+nanomq `7ae89a2b` 子模块 bump。S3 实机结果:QoS0/1/2 投递、
+retain 回读、REST、连接/断开 churn(即旧崩溃路径)全部通过,零 panic。
+
+**教训(移植契约)**:NanoNNG 的 Zephyr 分配器一旦不是 libc malloc,
+全仓库"一族分配、另一族释放"的写法都会变成堆腐蚀。此类已修:
+nanolib topic 队列(nng 80cf26b)、webhook cJSON(nanomq 84fd90f6)、
+mqtt codec/qos_db(nng cb34268)。后续审计建议:以
+`--wrap=free` + `nni_free` 越界探针做 CI 门禁。
 
 ### §22-3-old 历史记录(保留)
 
