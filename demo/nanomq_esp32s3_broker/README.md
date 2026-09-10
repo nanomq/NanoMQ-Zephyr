@@ -62,6 +62,18 @@ west build -b esp32s3_devkitc/esp32s3/procpu demo/nanomq_esp32s3_broker \
     -- -DEXTRA_CONF_FILE=local.conf     # Wi-Fi credentials
 ```
 
+Without `-d` the build lands next to the app
+(`demo/nanomq_esp32s3_broker/build/`, git-ignored) and `west flash` from
+the repo root picks it up.  The bring-up record was produced with an
+explicit `-d` into the west workspace instead; pass the same directory to
+both commands:
+
+```sh
+west build -b esp32s3_devkitc/esp32s3/procpu \
+    -d /path/to/ZephyrProject/build/esp32s3_nanomq \
+    demo/nanomq_esp32s3_broker -- -DEXTRA_CONF_FILE=local.conf
+```
+
 `local.conf` is git-ignored; start from `local.conf.example`.  Wi-Fi
 credentials live in `CONFIG_BROKER_WIFI_SSID/PSK` (app Kconfig) and never
 land in the tree.
@@ -69,9 +81,15 @@ land in the tree.
 ## Flash & run
 
 ```sh
-west flash -d build/esp32s3_nanomq --runner esp32 --esp-device /dev/ttyUSB0
+west flash -d <the same build dir you built into> \
+    --runner esp32 --esp-device /dev/ttyUSB0
 # serial console (115200): idf-monitor / miniterm
 ```
+
+`-d` is relative to the current directory unless absolute — the board is
+not found (`... is not a directory`) when pointing at a build dir that
+does not exist, e.g. repo-relative `build/...` while the workspace-level
+dir is what was built.
 
 Boot sequence on the console: PSRAM chip init + memory test → Zephyr →
 `wifi: connected` → DHCP (`net: ipv4 192.168.1.x`) → broker banner +
