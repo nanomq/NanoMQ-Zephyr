@@ -502,7 +502,31 @@ curl -s http://172.17.0.2:8081/api/v4/clients      # REST(§9-4;键为 data)
   搬 posix 池/net_buf;内核堆池 192 KB 留 picolibc 裸 malloc 余量
   (dram0_0_seg 77 %)。
 
-### §22-3 未决(上游,阻塞 MQTT 客户端验收)
+### §22-3 根因与修复记录(2026-09-10 更新)
+
+**(a) 分配器家族错配——已修复**(nng 80cf26b / nanomq 84fd90f6):
+上游在 POSIX 下 `nng 分配器 == libc malloc`,nanolib/nanomq 里大量
+"一族分配、另一族释放"的对象因此永远安全(汽车十余年无感)。把 nng
+分配器改到 PSRAM k_heap 后,每一次跨族释放都会打坏其中一侧的堆:
+- `mqtt_db.c topic_queue_free`(nni_zalloc ↔ free) — 订阅/断开路径;
+- `hash_table.c` 八处(nni/nng_* ↔ free,删除器已全 libc,已归一);
+- `mqtt_parser.c` 订阅队列生产者(nng_alloc ↔ libc 释放);
+- `webhook_post.c` 三处(cJSON_Print(libc) ↔ nng_strfree)— 每次连接
+  经 hook_entry 触发,把 k_heap 链接写进 libc arena,随后 libc free
+  把 `$SYS...` 主题字节当链表指针 → 确定性野写 panic。
+定位手段(可复用,已从仓库撤除):qemu 无损控制台实验室 +
+`--wrap=free` 正向探针 + `nni_free` 反向探针 + 逐操作堆校验环 +
+zfree 调用点探针;主机 ASAN 与上游同负载全绿用于排除共享代码。
+
+**(b) 剩余未决——重复事件导致同一 pub_packet 二次 teardown**:
+每次连接的 `online!` 事件被处理两轮(qemu 帧:
+`taskq_thread → server_cb:698 → free_pub_packet:1863 → k_heap_free`
+第二次释放同一 `pub_packet`,野指针写)。主机单轮所以 ASAN/glibc 全绿。
+下一步:在 broker.c 两处 `free_pub_packet` 与 CONNACK/notify 路径
+打印 `work`/`pub_packet` 指针确认双轮来源(疑似 notify 事件与正常
+CONNACK 共享 work 状态机的 Zephyr 调度分支),再修该路径。
+
+### §22-3-old 历史记录(保留)
 
 **现象**:首个 MQTT 客户端 CONNECT(纯订阅亦可)确定性写穿 PSRAM 堆 →
 `heap canary: corruption` / `double free` panic(EXTREME 下
