@@ -262,6 +262,28 @@ def _ci_module(name: str):
     return sys.modules[name]
 
 
+def _scale_ci_sleeps(m, scale: float) -> None:
+    """Make the CI module's time.sleep() run `scale` times longer.
+
+    mqtt_test.py / mqtt_test_v5.py settle with fixed 1-2 s sleeps that are
+    tuned for a localhost broker.  On real hardware (Wi-Fi + a ~100 ms
+    delayed-ACK per exchange) a subscriber needs ~1 s just to reach
+    SUBACK, so those sleeps leave no margin and the scripts lose the
+    race.  We replace the module's `time` binding with a shim whose sleep
+    is scaled; everything else (time.time etc.) passes through.
+    """
+    if scale == 1.0 or getattr(m, "_zf_time_scaled", False):
+        return
+    import types
+
+    real_time = m.time
+    shim = types.SimpleNamespace(
+        sleep=lambda s: real_time.sleep(s * scale),
+        **{n: getattr(real_time, n) for n in dir(real_time) if n != "sleep"})
+    m.time = shim
+    m._zf_time_scaled = True
+
+
 def group_mqtt_v311(addr: str, env: dict) -> None:
     """Upstream CI MQTT 3.1.1 suite, retargeted at the guest broker.
 
@@ -274,6 +296,7 @@ def group_mqtt_v311(addr: str, env: dict) -> None:
     m.g_addr = addr
     m.g_port = MQTT_PORT
     m.g_url = " -h {a} -p {p} ".format(a=addr, p=MQTT_PORT)
+    _scale_ci_sleeps(m, float(env.get("ZF_TIME_SCALE", "1.0")))
     ok = m.mqtt_test()
     assert ok, "mqtt_test() returned %r" % (ok,)
 
@@ -285,6 +308,7 @@ def group_mqtt_v5(addr: str, env: dict) -> None:
     m.g_addr = addr
     m.g_port = MQTT_PORT
     m.g_url = " -h {a} -p {p} ".format(a=addr, p=MQTT_PORT)
+    _scale_ci_sleeps(m, float(env.get("ZF_TIME_SCALE", "1.0")))
     ok = m.mqtt_v5_test()
     assert ok, "mqtt_v5_test() returned %r" % (ok,)
 
@@ -564,6 +588,7 @@ def run_worker(name: str, addr: str, args, timeout: float, attempts: int):
         "ZF_WEBHOOK_PORT": str(WEBHOOK_PORT),
         "ZF_CONTAINER": args.container,
         "ZF_WORKDIR": args.workdir,
+        "ZF_TIME_SCALE": str(args.time_scale),
     })
     last = None
     for attempt in range(1, attempts + 1):
@@ -618,6 +643,14 @@ def parse_args(argv=None):
                     help="stop at the first failing group")
     ap.add_argument("--retry-ws", type=int, default=1,
                     help="extra attempts for the ws groups (default: 1)")
+    ap.add_argument("--time-scale", type=float, default=1.0,
+                    help="multiply the CI scripts' fixed sleeps (default: "
+                         "1.0); raise it on real hardware, where Wi-Fi "
+                         "latency eats the localhost-tuned margins")
+    ap.add_argument("--retry", type=int, default=0,
+                    help="extra attempts for every group (default: 0); "
+                         "raise it for real-hardware runs, where Wi-Fi "
+                         "latency can beat the CI scripts' fixed sleeps")
     ap.add_argument("--timeout", type=float, default=None,
                     help="override the per-group timeout (seconds)")
     ap.add_argument("-v", "--verbose", action="store_true",
@@ -728,7 +761,8 @@ def main(argv=None) -> int:
                     % name)
                 return 2
             timeout = args.timeout or GROUP_TIMEOUT[name]
-            attempts = 1 + (args.retry_ws if name.startswith("ws_") else 0)
+            retry = args.retry_ws if name.startswith("ws_") else 0
+            attempts = 1 + max(retry, args.retry)
             log("[%d/%d] %-14s ..." % (idx, len(selected), name))
             t0 = time.time()
             status, output = run_worker(name, addr, args, timeout, attempts)
