@@ -124,10 +124,12 @@ port the nng allocator is the PSRAM k_heap, so each mismatch corrupts one
 of the two heaps.  Fixed here: mqtt_db.c / hash_table.c / mqtt_parser.c
 (nng 80cf26b) and webhook_post.c (nanomq 84fd90f6).
 
-Remaining: the CONNECT `client_status` event is processed **twice** on
-Zephyr, so the same `pub_packet` is torn down twice
-(`server_cb → free_pub_packet → k_heap_free`, wild write).  Host builds
-take a single pass (hence clean ASAN/glibc runs).  Forensics and next
-steps: PORTING_ZEPHYR.md §22-3(b).  Until that path is fixed, MQTT
-client traffic on this board still panics the broker; build/flash/boot/
-Wi-Fi/DHCP/REST are verified.
+Remaining (2026-09-10, second forensics round): the event flow is
+single-pass (probe-verified), all allocator-family mismatches are gone
+(bidirectional cross-free detectors return zero), and the crash is a
+corrupted k_heap free-list bucket in the event encode/free sequence on
+32-bit targets (qemu_x86 + xtensa both crash; host ASAN/glibc and the
+qemu libc-malloc branch do not; Zephyr's own tests/lib/heap passes on
+qemu_x86).  See PORTING_ZEPHYR.md §22-3(b) for the gdb evidence chain
+and next steps.  Until that is fixed, MQTT client traffic on this board
+still panics the broker; build/flash/boot/Wi-Fi/DHCP/REST are verified.

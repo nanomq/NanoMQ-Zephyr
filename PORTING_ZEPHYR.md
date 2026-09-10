@@ -518,13 +518,24 @@ curl -s http://172.17.0.2:8081/api/v4/clients      # REST(§9-4;键为 data)
 `--wrap=free` 正向探针 + `nni_free` 反向探针 + 逐操作堆校验环 +
 zfree 调用点探针;主机 ASAN 与上游同负载全绿用于排除共享代码。
 
-**(b) 剩余未决——重复事件导致同一 pub_packet 二次 teardown**:
-每次连接的 `online!` 事件被处理两轮(qemu 帧:
-`taskq_thread → server_cb:698 → free_pub_packet:1863 → k_heap_free`
-第二次释放同一 `pub_packet`,野指针写)。主机单轮所以 ASAN/glibc 全绿。
-下一步:在 broker.c 两处 `free_pub_packet` 与 CONNACK/notify 路径
-打印 `work`/`pub_packet` 指针确认双轮来源(疑似 notify 事件与正常
-CONNACK 共享 work 状态机的 Zephyr 调度分支),再修该路径。
+**(b) 剩余未决——k_heap 自由链损坏(证据已到帧级,2026-09-10 二轮取证)**:
+qemu(SMH 版)gdb 全程追踪结论:
+- **事件流单轮**(work 级探针 PRECV/PCONN/PNOT/PSENDF 每次连接各一次,
+  "双轮"假说被证伪);每连接两条 `online!` 日志 = demo main.c 在
+  `log_init()`(其内部已按 conf 注册 console)后又 `log_add_console()`
+  一次,两个 sink 各打一行——显示瑕疵,非崩溃因。
+- 家族错配双向探测器(wrap free + nni_free 窗口外检测)归零——修复完成。
+- 崩溃点:`free(块A)` 内 `set_prev_free_chunk(second)`,second 由 bucket
+  链读出且已是数据值 0x1ff8138d → 野写 0xffdd32c4。即**自由链表
+  bucket->next 被污染**;msg `m_refcnt` 在 encode 时=1(非 UAF 编码);
+  awatch 各队列数组只见合法访问。
+- 环境矩阵:qemu_x86 + k_heap 崩、xtensa S3 崩、Zephyr 官方
+  `tests/lib/heap`(qemu_x86)全过、host ASAN/glibc 与 qemu-libc-malloc
+  分支均不现 → 32 位 k_heap 与该事件编码/释放序列(小块高频
+  split/复用)交互缺陷,宿主侧不可复现。
+- 已试 workaround 并回退:mqtt_db 队列族 libc 化(与 parser/hash_table
+  同族)后 qemu 仍崩 → 布局无关,需在 free 前逐次 validate 锁内定位
+  第一坏点,或与 NanoNNG/Zephyr 上游比对 k_heap 特殊序列。
 
 ### §22-3-old 历史记录(保留)
 
