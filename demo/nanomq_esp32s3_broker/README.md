@@ -92,9 +92,19 @@ does not exist, e.g. repo-relative `build/...` while the workspace-level
 dir is what was built.
 
 Boot sequence on the console: PSRAM chip init + memory test → Zephyr →
-`wifi: connected` → DHCP (`net: ipv4 192.168.1.x`) → broker banner +
-REST listener.  Log timestamps show `1970-01-01` — the board has no RTC
-and no time source is wired (cosmetic).
+`wifi: connected` → DHCP (`net: ipv4 192.168.1.x`) → SNTP seed
+(`sntp: ntp.aliyun.com: epoch=…, realtime seeded`) → broker banner +
+REST listener.
+
+Log timestamps are real wall-clock **UTC**: the board has no RTC, so once
+DHCP has bound, main.c's `seed_realtime_from_sntp()` queries a public SNTP
+server and seeds `CLOCK_REALTIME` (nanolib's log module formats
+`time(NULL)`, so a correct system clock is all the timestamps need).
+Zephyr has no timezone database, so what is displayed is always UTC.  The
+seed is best effort — if no server answers (~9 s worst case) the broker
+still starts, just with the 1970 epoch.  Background, and why Zephyr's
+ready-made `net_init_clock_via_sntp()` helper was *not* reused:
+PORTING_ZEPHYR.md §22-4.
 
 ## Verified on hardware (bring-up record)
 

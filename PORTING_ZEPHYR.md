@@ -290,10 +290,10 @@ iow32(dev, RCTL, RCTL_EN | RCTL_MPE | RCTL_BAM | DT_INST_PROP(inst, rdmts) << RD
 
 ## 8. 局限与已知取舍
 - 线程模型:nng 平台 poller/taskq + POSIX 动态线程池上限 16(`CONFIG_POSIX_THREAD_THREADS_MAX`),broker 连接并发受其约束;栈 16 KB/线程
-- 时间戳:guest 日志已从 2026-09 起为真实 UTC —— demo main.c 启动时读
-  QEMU CMOS RTC(默认 `-rtc base=utc`)播种 `CLOCK_REALTIME`(lib/os/clock.c
-  的 offset+uptime 模型,播种后持续走时);Zephyr 无 TZ 数据库,显示恒为
-  UTC;真实板卡需自行接 RTC/时区处理
+- 时间戳:两个 demo 均已是真实 UTC(lib/os/clock.c 的 offset+uptime 模型,
+  播种后持续走时),但**时间源有意不同** —— qemu 启动时读 QEMU CMOS RTC
+  (默认 `-rtc base=utc`)播种;S3 实机无 RTC,改由 SNTP 播种(§22-4)。
+  Zephyr 无 TZ 数据库,显示恒为 UTC;时区仍需自行处理
 - 无文件系统:配置/日志/持久会话均无落盘;`$SYS` 只服务运行时
 - 目标板:qemu_x86(32 位)验证;同 ExternalProject 已含 32 位 ARM 原子回退
   (`NNG_ZEPHYR_NO_STDATOMIC`),但**未在真实板卡验证**(网络驱动、中断、内存
@@ -481,7 +481,8 @@ curl -s http://172.17.0.2:8081/api/v4/clients      # REST(§9-4;键为 data)
 - PSRAM 16 MB octal 识别 + memory test(80 MHz);构建/烧录/串口无碍。
 - Wi-Fi STA(DHCP):`wifi: connected` → `net: ipv4 192.168.1.10`。
 - broker banner + REST :8081 可达(host curl)。
-- 无 RTC,日志时间戳恒为 1970-01-01(已知外观,非缺陷)。
+- 日志时间戳:原为 `1970-01-01`(无 RTC);2026-09-10 起经 SNTP 播种为
+  真实 UTC(§22-4)。
 
 ### §22-2 bring-up 修掉的坑(均落 repo/子模块)
 
@@ -545,8 +546,231 @@ retain 回读、REST、连接/断开 churn(即旧崩溃路径)全部通过,零 p
 **教训(移植契约)**:NanoNNG 的 Zephyr 分配器一旦不是 libc malloc,
 全仓库"一族分配、另一族释放"的写法都会变成堆腐蚀。此类已修:
 nanolib topic 队列(nng 80cf26b)、webhook cJSON(nanomq 84fd90f6)、
-mqtt codec/qos_db(nng cb34268)。后续审计建议:以
-`--wrap=free` + `nni_free` 越界探针做 CI 门禁。
+mqtt codec/qos_db(nng cb34268)、dbhash_copy_topic_queue(见下文 (c))、
+nni_strndup(见下文 (d))。
+
+**错配是双向的,审计必须两个方向都查**:"nng 分配 → libc 释放"以及
+"libc 分配 → nng 释放"。前三次修的都是前者,(c) 正是后者的漏网实例。
+
+**这类 bug 在 POSIX 上单元测试抓不到**(两族同堆),回归只能靠 target
+集成测试。后续审计建议:以 `--wrap=free` + `nni_free` 越界探针做 CI
+门禁,或在 nng 的 Zephyr 分配器里加"指针必须落在堆内"的断言
+(最省事,能把整类问题在调用点当场炸出来)。
+
+**(c) 第二处家族错配——canary 假象(2026-09-10 定位并修复)**
+
+现象:实机漂移 panic `CANARY mem=0x3fcdXXXX exp=... found=00000000`,约
+2/6 次,一度被记为"间歇性堆 canary 损坏",并怀疑栈溢出或越界写零。
+
+真凶:**`dbhash_copy_topic_queue`(`nng/src/supplemental/nanolib/hash_table.c`)
+用 libc `calloc`/`strdup` 造副本,唯一调用者 `get_subscriptions`
+(`nanomq/rest_api.c` ~1966)却用 `nng_strfree`/`nng_free` 释放** ——
+即 (a)/(b) 同族的**反方向**实例。`nng_strfree` 把 SRAM 指针送进 PSRAM
+k_heap,`mem_to_chunkid` 算出堆外 chunk id,`chunk_trailer` 又绕回指针
+附近,读到零内存 → `found=00000000`。**根本不存在写入者,canary 报文
+是假象,不是腐蚀。**
+
+判别方法(一次定性,建议固化为探针):在 canary 失败处打印**堆边界**与
+**指针是否落在其中**。现场 `mem=0x3fcd3ff0`(SRAM 侧 libc 堆)而
+`heap=0x3c0e9d40..0x3c4e9d40`(PSRAM 侧 nng 堆)→ `inheap=0`,跨族释放
+实锤;payload 首字节即 `strdup` 出的主题串 `"topic"`。
+
+触发路径纠正:与 MQTT v5 断开风暴**无关**。最小复现 = 一条存活订阅 +
+`GET /api/v4/subscriptions/`,100% 必崩(单次请求打死板子)。这解释了
+v5 单组连跑 6 轮不出现、完整三组第一轮即命中。§22-3(b) 末尾所记
+"S3 实机 REST 全部通过"不准确:`--group rest_get` 当时为 FAIL
+(31.5s,`/api/v4/nodes/` 超时),正是本 bug 所致。
+
+修复:`dbhash_copy_topic_queue` 改用 `nng_zalloc`/`nng_strdup`(消费者已按
+nng 族释放,生产者对齐即可)。S3 结果:`GET /api/v4/subscriptions/`
+HTTP 200 稳定复跑;`--group rest_get` **FAIL 31.5s → PASS 3.7s**。
+
+**已排除的错误线索(别重走)**:
+- `CONFIG_HW_STACK_PROTECTION` 在 **xtensa 上不存在**
+  (`ARCH_HAS_STACK_PROTECTION` 仅由 arc/arm/arm64/riscv/x86 select),
+  写进 conf 是空操作,不能用来验证栈溢出;
+- Xtensa 是窗口寄存器 ABI、无帧链,`__builtin_return_address(≥1)`
+  **不可靠**,会给出貌似合理的错误调用链(取证中曾误得
+  `inplace_realloc → k_heap_free`)。调用链取证请用栈扫描 + 离线符号化;
+- 现场地址落在哪个堆,必须用符号表核对边界(`_system_heap` 只有
+  192 KB 且**不含** libc 堆;libc 堆是 `[_end, _heap_sentry)` ≈ 88 KB,
+  两者相邻但不同)。
+
+待修(已记录,不属本 bug):`dbhash_get_topic_queue_all` 在循环里
+`*res++` 后直接 `return res`,返回越界 4 字节的指针;当前零调用者
+(死代码),留待单独修复。
+
+**(d) 第三处:单函数根因 `nni_strndup`(2026-09-10 定位并修复)**
+
+`nni_strndup`(`nng/src/core/strs.c`)用 **libc `malloc`**,而它的三个兄弟
+`nni_strdup`/`nni_strnins`/`nni_strncat` 都用 nng 家族分配器。它对外暴露为
+`nng_strndup`(`nng.h`),调用方理所当然按 nng 族释放 —— 一行不一致,
+九个受害者。
+
+**实机取证**:一条 `SUBSCRIBE` + `UNSUBSCRIBE` 即 100% 打死板子
+(与 (c) 同一表现:`CANARY ... found=00000000`、`inheap=0`,
+payload 首字节为本例主题串 `"unsub/probe"`)。
+
+**功能测试套件抓不到它**:`mosquitto_sub/pub` 退出时只断开、**不发
+UNSUBSCRIBE**,所以 v5/v311 组连跑 6 轮全绿照样漏掉。这不是"偶发",
+是**套件覆盖盲区** —— 值得记住的教训:报"偶发"前先确认套件真的走到了
+那条路径。
+
+九个调用点已逐一核对,**全部按 nng 族释放**(故"改生产者"是唯一正确方向):
+`unsub_handler.c:221`(nng_free)、`conf_ver2.c:269`(nng_strfree)、
+`mqtt_parser.c:927-932` 六处 conn_param 字段(nng_free)、
+`bridge.c:1881`(nng_free)、`conf.c:694`(nni_strfree)。
+
+修复:`malloc` → `nni_alloc`。实机验证:UNSUBSCRIBE 正常走完
+(`nano_pipe_close: ... pipe close!`,无 panic),三组功能测试复跑全绿。
+
+**待修清单(已记录,本次不修)**
+
+以下由 2026-09-10 全仓库**双向**家族审计发现,均**未修复**:
+
+1. `conf.c` 销毁侧整体用 libc `free()`,而对象由 `conf_ver2.c`(HOCON,
+   即 Zephyr 默认解析器)按 nng 族分配。含 `nanomq_conf` 本身
+   (`broker.c:1852` `nng_zalloc` ↔ `conf.c:4611` `free`),以及
+   `conf_tls_destroy` / `conf_bridge_node_destroy` / `conf_web_hook_destroy` /
+   `conf_auth_http_req_destroy` / `conf_auth_destroy` / `conf_sqlite_destroy` /
+   `conf_tcp_node_destroy` / `conf_tlslist_destroy`。注意 `conf.c` 内**已有**
+   正确的 nng 族释放(如 `nng_free(node->dialer)`),上述 libc `free()` 是异类。
+   当前 demo 里 `conf_fini` 多只在错误路径走到,故未爆发。
+2. `FREE_NONULL`(`nanolib/conf.h:52`)是 libc `free`,却被用于 nng 族字段;
+   `broker.c` 侧重复 `-url` / `--tls-keypass` 参数即可命中(两个参数即触发)。
+3. `get_conf_value()`(`conf.c`)返回 libc 内存,而 30+ 处调用方用
+   `nng_strfree(value)` 释放(同文件另有 `free(value)` 的正确写法,故生产者
+   本身两族混用);连带 `conf_log_parse` 把该结果存进
+   `log->file/dir/rotation_sz_str`,由 `conf_log_destroy` 的 `nni_strfree` 释放。
+4. `file_load_data`(`nanolib/file.c:117`)对 `nni_alloc` 的缓冲用 libc
+   `realloc` —— 当前被 `CONFIG_FILE_SYSTEM` 关掉(§12 VFS 变体待做),开启即生效。
+5. SCRAM 路径(`mqtt_tcp.c` / `mqtt_tls.c`)libc `strndup` ↔ `nng_free(pwd2, 0)`,
+   由 `NNG_ENABLE_SCRAM` 关闭,当前不可达。
+6. **同现场但不同根因**(panic 长相一样,记录以免误判):
+   - `demo/zephyr_broker/src/main.c:248,286` 把**字符串字面量**赋给
+     `nmq_conf->url` / `websocket.url`,而 `conf_fini` 用 `nng_strfree` 释放
+     (即释放字面量;当前 `broker()` 不返回故不可达);
+   - `conf_fini` 释放 `nanomq_conf`,而同一指针归 `nano_sock_fini`
+     (`nmq_mqtt.c:487`)所有 —— **双重释放隐患**,与分配器家族无关。
+
+已核查为**干净、不必重查**的区域:`nanolib/hash_table.c`(除已修的
+`dbhash_copy_topic_queue`)、`mqtt_db.c`、`acl_conf.c`、`rule.c`、
+`parser.c`/`scanner.c`、`hocon.c`、`cJSON.c`(`cJSON_InitHooks` 从未调用)、
+`nanolib/linkedlist/`、`utils.c`/`md5.c`/`base64.c`、`rest_api.c`、
+`web_server.c`、`cmd_proc.c`、`core/zmalloc.c`。
+
+**(e) 测试台的陷阱:失败会自我放大(2026-09-10 查明)**
+
+`mqtt_v5` 的 `$share` 子测试曾连续 TIMEOUT,一度被怀疑是 (d) 引入的回归。
+实为**测试台缺陷**,与 broker 无关:
+
+- 上游 `mqtt_test_v5.py` 的 `test_shared_subscription()` 起 3 个
+  `$share/a/topic_share` 订阅者,断言三者**合计**收到 10 条;
+- **失败路径在 `return False` 前不 terminate 任何订阅者进程**(只有成功路径
+  terminate),于是每次失败都泄漏 5 个订阅者,其中 3 个仍在 `$share/a` 组
+  且会自动重连;
+- 下一次运行时 10 条消息在 3+3=6 个组内订阅者之间轮转,新的三个更收不满
+  → 再失败 → 再泄漏 3 个 …… **一旦失败过一次,之后再也过不了**;
+- 该脚本里本有 `clear_subclients()`(按 `pidof mosquitto_sub` 杀),
+  但**定义了却从未被调用**;
+- 本地 wrapper 的 `--no-manage` 又明确跳过 `kill_host_mosquitto_clients()`,
+  等于关掉了唯一的兜底清理。
+
+证据:先 `pkill -x mosquitto_sub; pkill -x mosquitto_pub` 清干净再跑,
+`mqtt_v5 PASS` 立即恢复;且成功的那次运行 `orphans left = 0`
+(成功路径确实会 terminate,失败路径不会 —— 与上述分析一致)。
+
+**实机验收操作建议**:
+1. 每轮测试前先清 `pkill -x mosquitto_sub; pkill -x mosquitto_pub`;
+2. 更省事:让 `demo/zephyr_broker/function_test.py` 在 `--no-manage` 下也调用
+   `kill_host_mosquitto_clients()`(建议改本地 wrapper,别动 vendored 的上游脚本);
+3. 判"偶发"之前先数 `pgrep -xc mosquitto_sub` —— 泄漏的订阅者会让 `$share`
+   断言必然失败,把它当成 broker bug 会白查很久。
+
+这与 (d) 是同一类教训:**先确认测试台可信,再怀疑被测对象**。
+另外注意 `--time-scale` 只缩放固定 sleep,对这类"进程泄漏型"失败无效。
+
+### §22-4 实机时钟:SNTP 播种 CLOCK_REALTIME(2026-09-10)
+
+**现象**:S3 无 RTC,`time()` 只反映开机时长,全部日志时间戳恒为
+`1970-01-01`(§22-1 曾记为"已知外观,非缺陷")。日志格式化本身的代码路径
+没问题 —— `nanolib/log.c` 走 `time(NULL)` → `localtime_r` → `strftime`
+(`log.c:464-465`),**只要 `CLOCK_REALTIME` 有真实种子,日志自动正确**,
+log.c 一行都不用改。
+
+**方案**:DHCP 绑定后、`broker()` 之前,用公开 API `sntp_simple()` 依次查询
+若干 NTP 服务器(带按序回退),成功后 `sys_clock_settime(SYS_CLOCK_REALTIME,
+&tspec)` 播种。实现在 `main.c` 的 `seed_realtime_from_sntp()`(约 25 行),
+只用到公开头文件 `<zephyr/net/sntp.h>` 与 `<zephyr/sys/clock.h>`。
+
+**为何没复用 Zephyr 现成的 `net_init_clock_via_sntp()`(试过,链接期失败)**
+`subsys/net/lib/config/init_clock_sntp.c` 里的这个函数功能完全对口 —— 它连
+分数换算 `tspec.tv_nsec = ((uint64_t)ts->fraction * NSEC_PER_SEC) >> 32` 和
+`sys_clock_settime` 都写好了,还顺带支持 DHCP option 42。但它所在**目录**的
+构建门禁是另一个符号:
+
+```
+# subsys/net/lib/CMakeLists.txt:14
+add_subdirectory_ifdef(CONFIG_NET_CONFIG_SETTINGS    config)
+```
+
+即**整个 `config` 目录(含该文件)只在 `CONFIG_NET_CONFIG_SETTINGS=y` 时才
+加入构建**。只开 `CONFIG_NET_CONFIG_CLOCK_SNTP_INIT=y`(它在 Kconfig 里确实
+只 `depends on SNTP`、不被 SETTINGS 包住)得到的是一个**链接错误**:
+
+```
+undefined reference to `net_init_clock_via_sntp'
+```
+
+**教训:核实"该符号可选"是不够的,必须一路核到"这个编译单元是否进构建"。**
+Kconfig 层与 CMake 层是两个独立门禁,前者能开不代表后者会编译。(另一面:
+这类失败是**响的** —— 链接期硬失败,而不是"编译通过但静默不生效"。)
+
+**为复用它而开 `NET_CONFIG_SETTINGS=y` 不划算**:该模块的语义是"用 Kconfig
+配静态 IP",与本 demo 自建的 Wi-Fi/DHCP 流程相反;更麻烦的是
+`NET_CONFIG_AUTO_INIT` **默认为 y**(`default y if !(USB_DEVICE_NETWORK ||
+...)`),得显式写 `=n` 才挡得住 `SYS_INIT` 钩子复活 —— 任何一次 Kconfig
+清理漏掉那行,`net_config_init_app()` 就会在 Wi-Fi 连接**之前**运行。为 25
+行代码引入这种"沉默的默认值"风险不值,故改为自写。
+
+**该内置路径的另一重障碍(留档备查)**:它的自动调用点挂在
+`net_config_init_app()`,由 `SYS_INIT(init_app, APPLICATION, ...)` 驱动
+(`init.c:557-567`),**早于 `main()` 里的 Wi-Fi 连接**;该函数找不到已 up 的
+接口就直接 `return 0`(`init.c:515-520`),SNTP 那一步根本走不到。此外
+`init_clock_sntp.c:25-28` 有 `BUILD_ASSERT`,要求服务器字符串非空。
+
+**为何 qemu 姊妹 demo 不接 SNTP(勿"顺手补齐")**:qemu 侧已有更优时间源 ——
+`seed_realtime_from_cmos()` 读 QEMU 仿真 CMOS RTC
+(`zephyr_broker/src/main.c:123-185`),即时且不依赖网络。而 SNTP 的自动路径在
+`SYS_INIT` 执行,**先于** `main()` 里的 CMOS 播种,结果是 SNTP 的值会被 CMOS
+无条件覆盖,除多一次启动期往返外毫无收益;要让它有意义就得把 CMOS 降级为
+兜底,那是给一台本来就有 RTC 的目标增加启动延迟与复杂度。故两 demo 时间源
+**有意不同**:qemu 用 CMOS,S3 用 SNTP。
+
+**实机验证(2026-09-10)**:
+
+```
+wifi: IPv4 address assigned (DHCPv4)
+sntp: ntp.aliyun.com: epoch=1789037388, realtime seeded
+net: iface 0x3fc96fa0 dev=wifi up=1
+net: ipv4 192.168.1.10
+2026-09-10 10:49:48 [0] INFO ... print_conf: This NanoMQ instance configured as:
+```
+
+`epoch=1789037388` 换算即 2026-09-10 10:49:48 UTC,与紧随其后的日志时间戳
+一致 —— 即日志时间戳确已由网络时间驱动,而非巧合。linker report:FLASH
+962 KB、`dram0_0_seg` 313992 B / 399108 B(**78.67%**;开启
+`CONFIG_DNS_RESOLVER` 前约 77%)—— SRAM 余量仍约 83 KB,故未启用"字面 IP"
+退路。
+
+**已知取舍**:Zephyr 无 TZ 数据库,日志显示恒为 UTC(§8);无 RTC 意味着每次
+重启都要重新同步,断网开机则退回 1970,启动最多被推迟约 9s(2 轮 × 2 服务器
+× 2s 超时 + 1s 轮间隔)。`CONFIG_DNS_RESOLVER` 因用主机名而开启,它 `select
+NET_SOCKETS_SERVICE`(多一个线程 + 缓冲);若 SRAM 吃紧,可改用字面 IPv4 并把
+DNS 整个关掉。
+
+**顺带记录(非本类,未修)**:REST `/api/v4/brokers/` 的 `uptime` 字段恒为
+`15360 Hours` 之类的离谱值(整数溢出嫌疑),与时钟播种无关。
 
 ### §22-3-old 历史记录(保留)
 

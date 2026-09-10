@@ -18,6 +18,7 @@
 #include <zephyr/sys/printk.h>
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/net_core.h>
+#include <zephyr/net/sntp.h> // sntp_simple() — clock seed
 #include <zephyr/sys/clock.h>
 
 #if !defined(CONFIG_X86)
@@ -32,8 +33,9 @@
 #include "nng/supplemental/nanolib/log.h"
 #include "mqtt_api.h" // log_init(conf_log *)
 
+#include <time.h> // struct timespec/time_t — CMOS seed and SNTP seed
+
 #if defined(CONFIG_X86)
-#include <time.h>              // time_t
 #include <zephyr/sys/sys_io.h> // io_port_t
 #include <zephyr/arch/x86/arch.h> // sys_in8()/sys_out8()
 #endif
@@ -351,6 +353,61 @@ wifi_sta_connect(void)
 }
 #endif /* CONFIG_WIFI_ESP32 */
 
+#if defined(CONFIG_SNTP)
+// Public NTP servers, tried in order.  sntp_simple() already retries with
+// exponential backoff inside its own timeout (subsys/net/lib/sntp/
+// sntp_simple.c), so a single call per server rides out a burst of lost
+// packets; the second entry only covers the first server being down.
+static const char *const sntp_servers[] = {
+	"ntp.aliyun.com",
+	"cn.pool.ntp.org",
+};
+
+// Seed CLOCK_REALTIME so that nanolib's log module (which formats
+// time(NULL), log.c) stamps real dates instead of the 1970 epoch.  Best
+// effort: with no server reachable the broker still starts, just with the
+// wrong clock.  We roll this by hand instead of calling Zephyr's
+// net_init_clock_via_sntp() because that lives in net_config, a directory
+// only added to the build by CONFIG_NET_CONFIG_SETTINGS (see prj.conf and
+// PORTING_ZEPHYR.md §22-4).
+static void
+seed_realtime_from_sntp(void)
+{
+	// Two passes with a pause in between: the likeliest failure right
+	// after DHCP binds is the resolver not being ready yet, and that
+	// fails immediately rather than consuming the timeout.
+	for (int pass = 0; pass < 2; pass++) {
+		for (size_t i = 0; i < ARRAY_SIZE(sntp_servers); i++) {
+			struct sntp_time ts;
+
+			if (sntp_simple(sntp_servers[i], 2000, &ts) == 0) {
+				// NTP fractions are in units of 1/2^32 s —
+				// the same conversion Zephyr's own
+				// net_init_clock_via_sntp() applies.
+				struct timespec t = {
+					.tv_sec  = (time_t) ts.seconds,
+					.tv_nsec = (long)
+					    (((uint64_t) ts.fraction *
+					    NSEC_PER_SEC) >> 32),
+				};
+
+				(void) sys_clock_settime(
+				    SYS_CLOCK_REALTIME, &t);
+				printk("sntp: %s: epoch=%lld, realtime seeded\n",
+				    sntp_servers[i], (long long) t.tv_sec);
+				return;
+			}
+			printk("sntp: %s: no reply\n", sntp_servers[i]);
+		}
+		if (pass == 0) {
+			k_msleep(1000);
+		}
+	}
+
+	printk("sntp: no server reachable, clock stays at the 1970 epoch\n");
+}
+#endif /* CONFIG_SNTP */
+
 void
 main(void)
 {
@@ -377,6 +434,13 @@ main(void)
 	if (wifi_sta_connect() != 0) {
 		printk("net: broker starting without a network interface\n");
 	}
+#endif
+
+#if defined(CONFIG_SNTP)
+	// Real wall clock before log_init()/broker() start printing
+	// timestamps.  Must come after the Wi-Fi/DHCP wait above: SNTP needs a
+	// route, an address and a working DNS resolver.
+	seed_realtime_from_sntp();
 #endif
 	dump_ifaces();
 
@@ -454,8 +518,11 @@ main(void)
 	// — broker_start_with_conf() normally does this, but the embedded demo
 	// calls broker() directly.
 	log_init(&nmq_conf->log);
-	log_add_console(NNG_LOG_WARN, NULL);
+	log_add_console(NNG_LOG_DEBUG, NULL);
+	print_conf(nmq_conf);
 #endif
+
+
 
 	broker(nmq_conf);
 

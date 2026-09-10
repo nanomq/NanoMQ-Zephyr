@@ -137,6 +137,13 @@ net: ipv4 10.0.2.15
 NanoMQ Broker is started successfully!
 ```
 
+This CMOS seeding is **deliberately qemu-only**.  The sibling ESP32-S3 demo
+([../nanomq_esp32s3_broker](../nanomq_esp32s3_broker/)) has no RTC at all
+and seeds the same clock over SNTP instead.  Do not "fix" the difference by
+enabling SNTP here: its auto-init path runs from `SYS_INIT`, i.e. *before*
+the CMOS seed in `main()`, so CMOS would simply overwrite the SNTP result —
+extra boot latency, no effect.  Rationale in PORTING_ZEPHYR.md §22-4.
+
 The guest broker listens on `10.0.2.15:1883` (static IP set in
 [prj.conf](prj.conf)); SLIRP forwards container `tcp:1883` to it.  Pick a
 different `hostfwd` port (e.g. `11883`) if 1883 is taken on the host.
