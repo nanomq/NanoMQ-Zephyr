@@ -140,8 +140,13 @@ http_aio_cb(void *arg)
 			nng_http_client_free(work->client);
 			work->client = NULL;
 		}
+		// The queue is drained only at the bottom of this function, so an
+		// error here must fall through to it rather than return: a receiver
+		// that stays unreachable would otherwise strand one queued event per
+		// in-flight failure, and send_msg() grows the lmq to hold them until
+		// the broker runs out of memory.
 		nng_mtx_unlock(work->mtx);
-		return;
+		goto drain;
 	}
 	msg = nng_aio_get_msg(aio);
 	nng_aio_set_msg(aio, NULL);
@@ -197,7 +202,7 @@ http_aio_cb(void *arg)
 				nng_http_client_free(work->client);
 				work->client = NULL;
 				nng_mtx_unlock(work->mtx);
-				return;
+				goto drain;
 			}
 
 			if ((rv = nng_http_req_alloc(&work->req, work->url)) != 0) {
@@ -208,7 +213,7 @@ http_aio_cb(void *arg)
 				nng_http_client_free(work->client);
 				work->client = NULL;
 				nng_mtx_unlock(work->mtx);
-				return;
+				goto drain;
 			}
 
 			for (size_t i = 0; i < conf->header_count; i++) {
@@ -237,6 +242,7 @@ http_aio_cb(void *arg)
 		nng_mtx_unlock(work->mtx);
 	}
 
+drain:
 	nng_mtx_lock(work->mtx);
 	if (!nng_lmq_empty(lmq)) {
 		// Send next webhook HTTP request.
