@@ -42,9 +42,12 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import signal
 import socket
+import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -110,6 +113,49 @@ def docker(container: str, args, check: bool = False, timeout: float = 120,
     cmd += ["-u", "root", container] + list(args)
     return subprocess.run(cmd, check=check, capture_output=capture,
                           text=True, timeout=timeout)
+
+
+# The CI scripts settle with fixed 1-2 s sleeps tuned for a localhost broker
+# (see _scale_ci_sleeps).  Which multiplier to use is decided by measuring the
+# path rather than by guessing from the address: loopback is well under 1 ms
+# and the docker bridge is around 1 ms, while the ESP32-S3 over Wi-Fi measured
+# 14-600 ms — two orders of magnitude apart.
+TIME_SCALE_LOCAL = 1.0
+TIME_SCALE_REMOTE = 4.0
+REMOTE_RTT_MS = 10.0
+# Two upstream v5/v3 subtests (retain-as-published, clean-session) are racy by
+# construction, so no time scale can save them — only a retry can.
+RETRY_LOCAL = 0
+RETRY_REMOTE = 2
+
+
+def measure_connect_ms(addr: str, samples: int = 5) -> float:
+    """Median TCP connect time to the broker port, in ms (-1.0 if refused).
+
+    A lower bound on the MQTT round trip, and enough to tell "same machine"
+    from "real hardware on Wi-Fi" without misclassifying the container bridge
+    the way an address-based rule would.
+    """
+    ts = []
+    for _ in range(samples):
+        t0 = time.perf_counter()
+        try:
+            with socket.create_connection((addr, MQTT_PORT), timeout=5):
+                ts.append((time.perf_counter() - t0) * 1000.0)
+        except OSError:
+            return -1.0
+    return statistics.median(ts)
+
+
+def _is_loopback(addr: str) -> bool:
+    if addr in ("localhost", "::1"):
+        return True
+    try:
+        import ipaddress
+
+        return ipaddress.ip_address(addr).is_loopback
+    except ValueError:
+        return False
 
 
 def broker_alive(addr: str, timeout: float = 5.0) -> bool:
@@ -357,6 +403,12 @@ def group_ws_v311(addr: str, env: dict) -> None:
 
     ws_test.py's Test.init() defaults host/port to localhost:8083 and
     ws_test() calls it with prot= only, so the defaults are the seam.
+
+    Note: unlike the two mqtt groups this one is NOT put through
+    _scale_ci_sleeps, and that is deliberate — measured on the S3 the suite
+    takes ~287 s unscaled, and stretching its sleeps 4x would push it past
+    the 600 s group timeout and turn a passing group into a timeout.  Its
+    2 s settles turn out to be generous enough on Wi-Fi as it is.
     """
     m = _ci_module("ws_test")
     orig_init = m.Test.init
@@ -378,6 +430,8 @@ def group_ws_v5(addr: str, env: dict) -> None:
     (a CONNECT-only property) on the PUBLISH properties, which paho 2.x
     rejects in the client thread — every v5 publisher died before it
     connected.
+
+    Like group_ws_v311 this one is deliberately left unscaled (see there).
     """
     import paho.mqtt.client as pmqtt
 
@@ -577,8 +631,37 @@ def worker_main(name: str) -> int:
 
 # ── orchestrator ─────────────────────────────────────────────────────
 
+def _kill_worker_group(proc) -> None:
+    """Kill a worker and anything it left behind.
+
+    Workers run with start_new_session=True, so a worker's pid *is* its
+    process group id and this reaps exactly the processes that group
+    started — the CI scripts' leaked mosquitto_sub clients — without
+    touching a mosquitto client the user started by hand.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass                              # already gone
+    try:
+        proc.wait(timeout=5)
+    except Exception:                     # noqa: BLE001
+        pass
+
+
 def run_worker(name: str, addr: str, args, timeout: float, attempts: int):
-    """Run one group in a subprocess; returns (status, detail)."""
+    """Run one group in a subprocess; returns (status, detail).
+
+    The worker's output goes to a temporary *file*, not a pipe.  The CI
+    scripts leak mosquitto_sub processes on their failure paths (see
+    PORTING_ZEPHYR.md §22-3(e)) and those grandchildren inherit the
+    worker's stdout; subprocess.run(capture_output=True) waits for the
+    pipe to reach EOF rather than merely for the child to exit, so a
+    single leaked subscriber made an already-failed group look hung for
+    its whole timeout (mqtt_v5: 600 s) even though its worker had died
+    immediately.  A file has no EOF to wait for, and the process-group
+    kill below clears the leak regardless.
+    """
     env = dict(os.environ)
     env.update({
         "ZF_ADDR": addr,
@@ -589,28 +672,48 @@ def run_worker(name: str, addr: str, args, timeout: float, attempts: int):
         "ZF_CONTAINER": args.container,
         "ZF_WORKDIR": args.workdir,
         "ZF_TIME_SCALE": str(args.time_scale),
+        # Unbuffered worker stdout: with block buffering the CI modules'
+        # print()s are flushed at exit and land in the capture file *after*
+        # the traceback that explains them, which reads backwards.
+        "PYTHONUNBUFFERED": "1",
     })
-    last = None
+    last_out = ""
     for attempt in range(1, attempts + 1):
         if attempt > 1:
             log("    retry %d/%d" % (attempt - 1, attempts - 1))
-        try:
-            last = subprocess.run(
+        timed_out = False
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8",
+                                    errors="replace") as out:
+            proc = subprocess.Popen(
                 [sys.executable, str(Path(__file__).resolve()),
                  "--worker", name],
-                env=env, capture_output=True, text=True, timeout=timeout)
-        except subprocess.TimeoutExpired as e:
-            # TimeoutExpired carries raw bytes even in text mode.
-            out = ""
-            for chunk in (e.stdout, e.stderr):
-                if chunk:
-                    out += chunk.decode("utf-8", "replace") \
-                        if isinstance(chunk, bytes) else chunk
-            return ("TIMEOUT", out[-4000:])
-        if last.returncode == 0:
-            return ("PASS", last.stdout)
-    out = (last.stdout or "") + (last.stderr or "")
-    return ("FAIL", out[-4000:])
+                env=env, stdout=out, stderr=subprocess.STDOUT,
+                text=True, start_new_session=True)
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            finally:
+                # Runs on the normal path *and* on KeyboardInterrupt: the
+                # worker holds a clean-session subscription open and steals
+                # $share traffic, so neither a leaked attempt nor a Ctrl-C
+                # may leave it (and its mosquitto clients) behind.
+                _kill_worker_group(proc)
+            out.seek(0)
+            last_out = out.read()
+        if timed_out:
+            return ("TIMEOUT", last_out[-4000:])
+        if proc.returncode == 0:
+            return ("PASS", last_out)
+        # Show this attempt's failure now: if a later attempt passes,
+        # run_worker returns that attempt's output and this one's detail is
+        # lost — exactly the evidence needed to tell a real defect from a
+        # flaky race (see PORTING_ZEPHYR.md §22-3(e)).
+        if attempt < attempts:
+            log("    attempt %d/%d failed:" % (attempt, attempts))
+            for line in last_out.rstrip().splitlines()[-25:]:
+                log("        | " + line)
+    return ("FAIL", last_out[-4000:])
 
 
 def parse_args(argv=None):
@@ -643,14 +746,17 @@ def parse_args(argv=None):
                     help="stop at the first failing group")
     ap.add_argument("--retry-ws", type=int, default=1,
                     help="extra attempts for the ws groups (default: 1)")
-    ap.add_argument("--time-scale", type=float, default=1.0,
-                    help="multiply the CI scripts' fixed sleeps (default: "
-                         "1.0); raise it on real hardware, where Wi-Fi "
-                         "latency eats the localhost-tuned margins")
-    ap.add_argument("--retry", type=int, default=0,
-                    help="extra attempts for every group (default: 0); "
-                         "raise it for real-hardware runs, where Wi-Fi "
-                         "latency can beat the CI scripts' fixed sleeps")
+    ap.add_argument("--time-scale", type=float, default=None,
+                    help="multiply the CI scripts' fixed sleeps; default: "
+                         "chosen from the measured broker round trip "
+                         "(%.1f for real hardware, %.1f for a local broker)"
+                         % (TIME_SCALE_REMOTE, TIME_SCALE_LOCAL))
+    ap.add_argument("--retry", type=int, default=None,
+                    help="extra attempts for every group; default: chosen "
+                         "from the measured broker round trip (%d for real "
+                         "hardware — two CI subtests are racy by "
+                         "construction and need it — 0 for a local broker)"
+                         % RETRY_REMOTE)
     ap.add_argument("--timeout", type=float, default=None,
                     help="override the per-group timeout (seconds)")
     ap.add_argument("-v", "--verbose", action="store_true",
@@ -752,14 +858,47 @@ def main(argv=None) -> int:
             log("ERROR: no broker answering at %s:%d" % (addr, MQTT_PORT))
             return 2
 
+    # Pick the hardware-tuned defaults.  The CI scripts' sleeps are tuned for a
+    # localhost broker, and two of their subtests are racy by construction
+    # (PORTING_ZEPHYR.md §22-3(g)), so a board over Wi-Fi wants both a
+    # stretched scale and a retry.  Deciding from a measured round trip beats
+    # making every hardware run remember the flags; explicit flags always win.
+    rtt = measure_connect_ms(addr)
+    remote = rtt >= REMOTE_RTT_MS
+    explicit_scale = args.time_scale is not None
+    explicit_retry = args.retry is not None
+    if not explicit_scale:
+        args.time_scale = TIME_SCALE_REMOTE if remote else TIME_SCALE_LOCAL
+    if not explicit_retry:
+        args.retry = RETRY_REMOTE if remote else RETRY_LOCAL
+    log("broker connect RTT %.1f ms%s -> time-scale %.1f%s, retry %d%s"
+        % (rtt, "" if rtt >= 0 else " (unreachable)",
+           args.time_scale, "" if explicit_scale else " (auto)",
+           args.retry, "" if explicit_retry else " (auto)"))
+
     results = []
     failed = 0
+    broker_gone = False
     try:
         for idx, name in enumerate(selected, 1):
-            if broker.manage and not broker.ensure_up():
-                log("ERROR: broker unreachable before group %s — aborting"
-                    % name)
-                return 2
+            if broker.manage:
+                if not broker.ensure_up():
+                    log("ERROR: broker unreachable before group %s — "
+                        "aborting" % name)
+                    broker_gone = True
+                    break
+            elif not broker_alive(addr):
+                # --no-manage: there is nothing to restart, but say so
+                # plainly rather than letting every later group fail for
+                # unrelated-looking reasons.  A dead broker is a real
+                # outcome on this board — the WebSocket listener collapses
+                # under repeated connects (PORTING_ZEPHYR.md §22-5).
+                log("ERROR: broker at %s stopped answering before group %s "
+                    "— aborting the rest.  If it died rather than being "
+                    "stopped, the serial console has the crash."
+                    % (addr, name))
+                broker_gone = True
+                break
             timeout = args.timeout or GROUP_TIMEOUT[name]
             retry = args.retry_ws if name.startswith("ws_") else 0
             attempts = 1 + max(retry, args.retry)
@@ -781,6 +920,18 @@ def main(argv=None) -> int:
             for line in (output or "").rstrip().splitlines()[-40:]:
                 log("    | " + line)
             broker.tail_serial(broker.serial_log, 20)
+            # A failure at the default time scale is far more likely to be
+            # the CI scripts' localhost-tuned 1-2 s sleeps losing the race
+            # than a broker defect — say so before anyone starts debugging
+            # the guest.  Deliberately emitted only on an actual failure, so
+            # the localhost/qemu flows (where 1.0 is correct) never see it.
+            if args.time_scale == 1.0 and not _is_loopback(addr):
+                log("    HINT: this group failed with --time-scale 1.0 "
+                    "against a non-local broker.  On real hardware a "
+                    "subscriber needs ~1 s just to reach SUBACK, so the CI "
+                    "scripts' fixed 1-2 s sleeps lose the race; re-run with "
+                    "--time-scale 4 (usually also --retry 2) before "
+                    "suspecting the broker — PORTING_ZEPHYR.md §22-3(e).")
             if args.fail_fast:
                 log("--fail-fast: stopping")
                 break
@@ -791,6 +942,8 @@ def main(argv=None) -> int:
     for name, status, dt in results:
         log("%-14s %-8s %6.1fs" % (name, status, dt))
     log("RESULT: pass=%d fail=%d" % (len(results) - failed, failed))
+    if broker_gone:
+        return 2
     return 1 if failed else 0
 
 

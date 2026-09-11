@@ -146,3 +146,12 @@ Run the suite against the board with:
 python3 demo/zephyr_broker/function_test.py --no-manage --addr <board-ip> \
     --group mqtt_v311 --group mqtt_v5 --group rest_get
 ```
+
+The runner tunes itself to the hardware: it measures the TCP round trip to the
+broker and, when that says "not localhost" (loopback and the container bridge
+are both under ~1 ms; this board measures 14–600 ms over Wi-Fi), defaults to
+`--time-scale 4 --retry 2`.  Both are needed — the stretched scale covers the
+CI scripts' localhost-tuned sleeps, and the retry covers two of their subtests
+that are racy by construction.  An explicit `--time-scale`/`--retry` always
+wins; the values actually used are printed at startup
+(PORTING_ZEPHYR.md §22-3(e)/(g)).

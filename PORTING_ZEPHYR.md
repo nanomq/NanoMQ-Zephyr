@@ -681,14 +681,105 @@ UNSUBSCRIBE**,所以 v5/v311 组连跑 6 轮全绿照样漏掉。这不是"偶�
 (成功路径确实会 terminate,失败路径不会 —— 与上述分析一致)。
 
 **实机验收操作建议**:
-1. 每轮测试前先清 `pkill -x mosquitto_sub; pkill -x mosquitto_pub`;
-2. 更省事:让 `demo/zephyr_broker/function_test.py` 在 `--no-manage` 下也调用
-   `kill_host_mosquitto_clients()`(建议改本地 wrapper,别动 vendored 的上游脚本);
+1. **实机参数已自动判定,无需再手记**:`function_test.py` 启动时实测到 broker 的
+   TCP 连接中位延迟(loopback <1 ms、docker 桥 ~1 ms、ESP32-S3 经 Wi-Fi 实测
+   14–600 ms),慢则默认 `--time-scale 4 --retry 2`,快则 `1.0/0`;显式传入的
+   `--time-scale` / `--retry` 始终优先,启动时会打印实际取值与依据。二者
+   **缺一不可**:scale 治"sleep 余量不足",retry 治"子测试本身带竞速"(见 (g));
+2. 泄漏已由 runner 自动清理(见 (f)),不必再手动 `pkill`;要确认的话数
+   `pgrep -xc mosquitto_sub`;
 3. 判"偶发"之前先数 `pgrep -xc mosquitto_sub` —— 泄漏的订阅者会让 `$share`
    断言必然失败,把它当成 broker bug 会白查很久。
 
 这与 (d) 是同一类教训:**先确认测试台可信,再怀疑被测对象**。
 另外注意 `--time-scale` 只缩放固定 sleep,对这类"进程泄漏型"失败无效。
+
+**(f) 失败被伪装成"卡死":管道 EOF(2026-09-11 查明并修复)**
+
+现象:`mqtt_v311` 快速 FAIL 后,`mqtt_v5` 一直"卡住",要等满整组超时才继续
+(mqtt_v5 的组超时为 **600s**)。一度以为 worker 卡在 CI 脚本里,实测
+**worker 早已退出**:
+
+```
+orchestrator 已跑 04:57
+worker 子进程:不存在,只剩 <defunct> 僵尸
+父进程仍持有 1 个 pipe fd
+```
+
+真因:`run_worker()` 原用 `subprocess.run(..., capture_output=True)`,它等的
+是**管道 EOF**,而非仅仅子进程退出。泄漏的 `mosquitto_sub` 孙进程继承了
+管道写端且永不退出 → EOF 永不到来 → worker 虽已死,orchestrator 仍要读到
+超时才返回。**这是 (e) 那个泄漏的第二个症状:失败不只毒化下一轮,还把
+"快速失败"伪装成"卡死"。**
+
+修复(已落地 `demo/zephyr_broker/function_test.py`,未动 vendored 上游脚本):
+1. worker 输出改为重定向到**临时文件**而非管道 —— 文件没有 EOF 可等;
+2. worker 以 `start_new_session=True` 启动,每次尝试后
+   `os.killpg(worker_pid, SIGKILL)` —— 精确清掉它自己那一组的泄漏客户端,
+   **不误伤用户手动起的 mosquitto**;
+3. worker 环境加 `PYTHONUNBUFFERED=1`,让 CI 脚本的 print 与 traceback 按
+   真实时序落盘(块缓冲会把明细排到 traceback 之后,读起来是倒的);
+4. 失败 + `--time-scale 1.0` + broker 非本机时打印 HINT —— **只在真失败时**
+   出现,故 qemu/localhost 流程(那里 1.0 本就正确)不会看到假阳性。
+
+实测(同一命令,不带 `--time-scale`):由"卡满 600s"变为 **12.6s 结束**
+(v311 FAIL 2.1s、v5 FAIL 5.6s、rest_get PASS 3.3s),运行后
+`mosquitto_sub` 计数为 0、无僵尸进程。
+
+**(g) 上游 retain 子测试的固有竞速:普通订阅者看不见实时投递(2026-09-11 查明)**
+
+现象:`mqtt_v5` 反复失败在链尾 `Retain As Published test failed!`,且**每次
+尝试都可能失败**(实测带 `--retry 2` 时连续 2 次失败、第 3 次才过);每次
+耗时约 106s,等于跑满整条链。
+
+**先排除一个错误假设(留档以免重走)**:一度认为是上一轮残留在 `topic` 上的
+保留消息让订阅者收到 2 条。据此在 wrapper 里加过"每次尝试前清保留消息",
+**实测证伪**:清干净后每次尝试依然可能失败,而且**反而更糟**(见下方推论 2)。
+
+**真因**:`mqtt_test_v5.py::test_retain_as_publish()` 用
+`cnt_substr(..., " r1,")` 数输出行里的 **RETAIN 标志位**,而它有两个订阅者:
+
+| 订阅者 | 消息来自保留存储 | 消息为实时投递 |
+|---|---|---|
+| `--retain-as-published` | `r1` → 计 1 | `r1` → 计 1 |
+| **普通订阅者(无 RAP)** | `r1` → 计 1 | **`r0` → 计 0** |
+
+按 MQTT 规定,**实时投递**给非 RAP 订阅者的 PUBLISH 其 RETAIN 被置 0。于是
+普通订阅者**只有"订阅晚于保留发布"时才计得到 1**;它若抢先订阅成功,收到的
+实时投递是 ` r0,`,计数为 0 → `cnt.value != 1` → 失败。
+
+实测(单独复现该子测试 5 次,打印真实计数 —— 上游脚本自己从不打印它们):
+
+```
+run 1: plain=0 rap=1  -> FAIL
+run 2: plain=0 rap=1  -> FAIL
+run 3: plain=0 rap=1  -> FAIL
+run 4: plain=1 rap=1  -> PASS
+run 5: plain=1 rap=1  -> PASS
+```
+
+**两个反直觉的推论(均已实测)**:
+
+1. **`--time-scale` 对它无效**:竞速在"`mosquitto_pub` 与两个 `mosquitto_sub`
+   的**进程启动顺序**"上,不是 sleep 时长 —— 缩放那个 1s 的 sleep 影响不到它;
+2. **不要清 `topic` 的保留消息**:保留消息在时,普通订阅者总能从存储拿到
+   ` r1,` → 确定性通过;清空后每次尝试都退回竞速。曾加过的
+   `reset_broker_state()` 正是踩了这个坑(把"只有第 1 次可能失败"变成"每次
+   都可能失败"),**已撤除**。
+
+**为何 `--retry` 在这里"碰巧"有效**:第 1 次尝试若失败,它自己就把保留消息留
+在了 `topic` 上(上游那条清理命令 `pcr_cmd = "... -m \"\" -d"` **漏了
+`--retain`**,按 MQTT 根本清不掉,而 v311 的 `test_retain()` 用 `-n -r` 是
+对的),于是第 2 次起变成确定性通过。**这是状态残留的副作用,不是"重试能修
+竞态"** —— 记下来以免后人据此得出错误结论。
+
+**判读建议**:`Retain As Published test failed!` 单独出现时,看 `--retry` 是否
+已让整组通过,并用**通过率**(而非单次结果)判断 broker 是否有问题。
+
+**顺带修掉一个妨碍诊断的老问题**:`run_worker()` 此前只在**最终**失败时返回
+输出;若第 1 次失败、第 2 次通过,则第 1 次的明细被丢弃 —— 正是判"真缺陷 vs
+竞态"所需的那份证据。现在每次失败的尝试都会立即打印其尾部 25 行(本节结论
+正是靠它才拿到的)。
 
 ### §22-4 实机时钟:SNTP 播种 CLOCK_REALTIME(2026-09-10)
 
@@ -771,6 +862,54 @@ DNS 整个关掉。
 
 **顺带记录(非本类,未修)**:REST `/api/v4/brokers/` 的 `uptime` 字段恒为
 `15360 Hours` 之类的离谱值(整数溢出嫌疑),与时钟播种无关。
+
+### §22-5 WS 中止连接泄漏:约 25 次耗尽连接池(2026-09-11 查明,未修)
+
+**现象**:对 8083 反复做"WebSocket 握手成功 → 立刻关闭"(**不发 MQTT
+CONNECT**),约 25 次后 broker 的**全部监听面**停止服务:1883/8081/8083 对新
+连接一律 `ConnectionRefused`(即 Zephyr 池尽时回的 RST,§7-18),ICMP 仍正常
+(IP 栈没死),**不自愈,必须复位板子**。
+
+**复现与关键数字**(从刚复位、零客户端的板子起):
+
+```
+第 1–25 次 WS 握手: 全部成功
+第 26 次:           WS 握手开始失败(mqtt/rest 尚存)
+第 27 次:           三面全停
+```
+
+**对照实验(排除探针自身)**:
+- 同样节奏但**不含 WS**(只做 TCP 连 1883 + HTTP GET 8081):**120 次连接
+  全部正常**;
+- **正常 WS 用法**各 40 轮均无泄漏:paho 完整 MQTT-over-WS(v3.1.1)、
+  MQTTv5-over-WS、固定 `client_id` 快速重连。
+
+即**泄漏专属于"握手完成、但 MQTT 协商从未进行就断开"这条路径**,而不是
+"WS 连接多了就会死"。
+
+**推断(未证实到具体代码)**:每次这类中止连接泄漏一份 socket/net_context,
+`CONFIG_NET_MAX_CONTEXTS=32` 减去监听器与在用连接,约 25 次即耗尽。
+
+**候选泄漏点**(仅代码审阅,未插桩证实)——`wstran_accept_cb`
+(`nng/src/sp/transport/mqttws/nmq_websocket.c:1681`):
+
+1. accept 成功分支中,若 `uaio == NULL`(没有等待中的用户 accept aio),取到的
+   `ws`(已 accept 的 stream)**既没 close 也没 free**;
+2. `wstran_pipe_alloc()` 失败时只 `nng_stream_close(ws)`,**没有
+   `nng_stream_free(ws)`** —— 而 stream 对象与底层 socket 是由 free 释放的
+   (对照:正常路径 `wstran_pipe_fini` 里有 `nng_stream_free(p->ws)`)。
+
+**已排除的猜测**:①"`wstran_pipe_fini` 漏了 `nng_stream_free`"不成立 —— 它有;
+②§7-20 记录的 `user_rxaio` 完成路径修复**确实在当前代码里**。
+
+**本缺陷与 ws 功能测试的关系**:`ws_v311` / `ws_v5` 走的是**完整 MQTT-over-WS**
+(每次都发 CONNECT),实测在干净板子上**都能通过**(287.4s / 15.3s),不属于本条
+路径。曾有"ws 组卡住 = 本缺陷发作"的判断,已证伪。
+
+**影响与建议**:中止的 WS 连接(端口扫描、客户端握手后立刻崩溃/超时、只做
+握手不建 MQTT 的健康检查)足以打死 broker 且不自愈。修复需在 nng 侧给上述
+分支补上释放;在修好之前,对 WS 端口做健康探测请走**完整的 MQTT-over-WS
+连接**,不要只做握手。
 
 ### §22-3-old 历史记录(保留)
 
