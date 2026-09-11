@@ -112,7 +112,7 @@ demo/zephyr_broker/README.md        构建/运行/验收速览
 `CONFIG_ZVFS_POLL_MAX=16`、pthread mutex/cond 池 1024、hostfwd 8081;
 Kconfig 增 `BROKER_REST_API`/`BROKER_WEBHOOK`;main.c 覆盖
 `qos_duration=1`(默认 10 s,keepalive/会话到期检查粒度太粗)并启用
-REST(NONE_AUTH)与 webhook(inproc hook 通道,`MESSAGE_PUBLISH(test/#)` +
+REST(NONE_AUTH)与 webhook(inproc hook 通道,`MESSAGE_PUBLISH(hook/#)` +
 `CLIENT_CONNACK` 两条规则);CMakeLists 把 `ACL_SUPP` 并入
 `NNG_EXTRA_CFLAGS`。各动机详见 §7 行 10-13。
 
@@ -328,12 +328,23 @@ REST 走 `:8081`,webhook 接收器 `hook_receiver.py` 挂在 10.0.2.2 别名
 4. **HTTP/REST/Webhook**(✅ 行为已验证,2026-09;rule-engine 除外):
    - REST:`curl :8081/api/v4/clients` 返回 JSON,连接建立 ~0.4 s 后出现
      于 `data` 列表、断开 ~5.7 s 后消失(顶层键是 `data`,§7-15);
-     conf 侧 `http_server.enable` + `NONE_AUTH`(conf_init 默认 BASIC)
+     conf 侧 `http_server.enable` + `auth_type=BASIC`
+   - **REST 认证(2026-09-11 改为 BASIC)**:两个 demo 的 main.c 设
+     `auth_type = BASIC` 并显式填 `username="admin"` / `password="public"`
+     (与 `etc/nanomq.conf`、上游文档一致)。**必须填凭据**:`conf_http_server_init()`
+     只把 auth_type 置为 BASIC,username/password 留 NULL,而
+     `basic_authorize()`(`rest_api.c`)对两者做 `strlen()` —— 只改枚举不填
+     凭据会在首个 REST 请求上解引用 NULL。实测:无凭据 401、`admin:public`
+     200、错误口令 401(实机与 qemu 均验)。注意 Basic + 明文 HTTP 只是
+     base64,不是加密(TLS 未编译进 Zephyr NanoNNG)。
    - webhook:host 侧 `hook_receiver.py` 收到规则 POST —— 每个连接 1 条
      `client_connack`(含 clientid/proto_ver/keepalive/conn_ack),每条
-     `test/#` 发布 1 条 `message_publish`(含 ts/topic/qos/payload);
+     `hook/#` 发布 1 条 `message_publish`(含 ts/topic/qos/payload);
      验证了"嵌入式 conf → inproc hook 通道 → nng HTTP client → 外部
-     接收器"整条转发链
+     接收器"整条转发链。**接收端地址改为构建期配置**
+     `CONFIG_BROKER_WEBHOOK_URL`(空则不启用转发器),且**两个 demo 现均
+     默认关闭**(§22-6 的开关建议):qemu 填宿主别名 `10.0.2.2:18080`
+     (即跑 qemu 的机器本身),实机在 `local.conf` 填宿主的 LAN 地址
    - rule-engine:嵌入式 conf 无对应开关路径,未验证(维持原状)
 5. **IPC cmd server**(保持关闭):`ipc_internal=false`,NNG_TRANSPORT_IPC=OFF
    —— `nanomq ctl` 管理通道不可用;如需需引入 IPC 传输
@@ -961,6 +972,65 @@ TCP 握手,裸 connect 照样成功,必须驱动真实会话。
 加上 TCP TIME_WAIT 在途连接所致(**未逐一定性**)。判据是它与 N **无关**:
 N=50 与 N=400(=8 倍)峰值同为 7。改为 700ms 间隔的慢速压测后,`ctx` 全程
 恒为 4。原缺陷是**每条中止连接 +1 且永不回落**,与此有本质区别。
+
+### §22-6 webhook 发送失败不排空队列:接收端不可达时吃光内存(2026-09-11 查明并修复)
+
+**现象**:S3 实机开启 webhook 后,**接收端不在线**时跑 `ws_v311`,broker
+**静默卡死**——三个端口仍能完成 TCP 三次握手(backlog 应答),REST 返回
+`000`(无响应),串口**无任何输出**(不是 panic),ICMP 正常。复位后立即恢复。
+这正是 §22-5 那条教训的另一个实例:*裸 TCP connect 不是判活手段*。
+
+**对照实验**(同一固件、同一测试):
+- **接收端不在线** → broker 卡死;
+- **接收端在线** → broker 存活(REST 200、MQTT CONNACK `2002`)。
+
+**根因**:`nanomq/webhook_inproc.c` 的 `http_aio_cb()`。函数末尾有一段
+drain(取出 `w->lmq` 里的下一条事件并发送),**只有成功路径会落到那里**;
+aio 出错时走的是:
+
+```c
+nng_mtx_unlock(work->mtx);
+return;              /* 跳过 drain */
+```
+
+于是发送失败一次,队列就少排空一次。而 `send_msg()` 在 aio 忙时把新事件
+`nng_lmq_put()` 入队,队列满时还会 `nng_lmq_resize()` **扩容**。接收端持续
+不可达 ⇒ 队列只进不出 ⇒ 内存单调增长。qemu 有 31 MB 放着看不出来;S3 只剩
+约 85 KB SRAM,几百条事件即耗尽。
+
+**为何现在才暴露**:S3 demo 此前 **webhook 是关的**(§22-5 的那句旧 README
+"WS/webhook/DEBUG log stay off"),这条路径从未在实机跑过。2026-09-11 为
+webhook 测试支持而启用后立即命中。**是既有缺陷被新配置暴露,不是本次引入。**
+
+**修复**:`http_aio_cb()` 中三处"清理完就 return"改为一律 `goto drain`
+(共 9 行):aio 错误路径、`work->conn == NULL`、`nng_http_req_alloc` 失败。
+`nng_http_conn_write_req()` 那处的 `return` **保持不动** —— 它是发起了异步
+写,由该写的回调回来 drain,不是"放弃"。
+
+**同一批发现的另一件事(已一并处理)**:demo 的 webhook 规则主题原本是
+`MESSAGE_PUBLISH(test/#)`,而 CI 的 `ws_test.py` **恰好就用 `test/...`**
+(16 处)。于是 WS 测试每发一条消息都触发一次跨 Wi-Fi 的 HTTP POST —— 在 S3
+上把 `ws_v311` 压到超时/丢消息。已核查其余三个 CI 脚本(`mqtt_test.py`、
+`mqtt_test_v5.py`、`ws_v5_test.py`)不使用该命名空间,故只有 ws_v311 受影响。
+规则主题改为 `hook/#`,webhook 测试组相应发到 `hook/webhook`。
+
+**开关建议:webhook 默认关闭,需要时再开(2026-09-11 实测)**。`CLIENT_CONNACK`
+规则对**每次客户端连接**都触发一次 POST,接收端不在线时每次连接就多一次失败的
+HTTP 连接 + 两行同步日志(`CONFIG_LOG_MODE_IMMEDIATE=y`)。实测实机单跑
+`mqtt_v5`:**97 次** POST 失败 / 114 次连接;该组里那个"按 `mosquitto_pub` 与
+两个 `mosquitto_sub` 的进程启动顺序决出胜负"的 retain 子测试(§22-3(g))
+**三轮全败**,而关闭 webhook 后恢复为"重试后通过"。即 webhook 的每连接开销
+**恰好打在**最计时敏感的竞态判定点上。故 `prj.conf` 保持 webhook 关闭,只在
+验证 webhook 本身时于 `local.conf` 打开。
+
+**排查教训**:这次是"启用一个默认关闭的功能"暴露出既有缺陷。判断"是不是我
+改坏的"靠的是**对照实验**(接收端开/关各跑一次、webhook 开/关各跑一次),
+而不是读代码猜。
+
+**另一条操作教训**:用 `pkill -f <pattern>` / `pgrep -f <pattern>` 清理进程时,
+若该 pattern 字面量出现在**当前命令行**的其它位置(例如后台任务的整条命令里
+就含 `hook_receiver.py`),会杀掉自己。本次连踩两次。改用 `ss -ltnp` 取 PID 后
+`kill <pid>`,或用 `pgrep -x`。
 
 ### §22-3-old 历史记录(保留)
 
