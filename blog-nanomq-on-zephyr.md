@@ -162,8 +162,6 @@ diff --git a/drivers/ethernet/eth_e1000_priv.h b/drivers/ethernet/eth_e1000_priv
 | REST API | 8081 | 支持 | 支持 | Basic 认证（`admin` / `public`），无 TLS |
 | MQTT over WebSocket | 8083 | 支持 | 支持 | 无认证，无 TLS（路径 `/mqtt`） |
 
-Webhook 未在上表：它不对外监听，而是主动向外部接收器（`hook_receiver.py`，默认 `:18080`）POST 事件 JSON。**两个 demo 都默认关闭**，只在需要验证 webhook 时开启——原因见下文的实测数据：规则 `CLIENT_CONNACK` 对每次客户端连接都会触发一次 POST，开着会拖慢计时敏感的测试组。
-
 ### 安全前提
 
 两个 demo 的默认配置都以**受控实验环境**为前提，直接照搬会带来风险：
@@ -197,15 +195,6 @@ CONFIG_BROKER_WIFI_SSID="your-ssid"
 CONFIG_BROKER_WIFI_PSK="your-passphrase"
 ```
 
-若要一并启用 webhook，在同一个文件里补上接收端地址。注意它必须是**运行接收器那台机器的局域网地址**（不是 `127.0.0.1`，也不是 qemu 的 `10.0.2.2`），因此换网络后需要重新编译；不填则 webhook 保持关闭：
-
-```conf
-CONFIG_BROKER_WEBHOOK=y
-CONFIG_BROKER_WEBHOOK_URL="http://192.168.1.13:18080/"
-```
-
-**建议只在需要验证 webhook 时打开它。** 规则 `CLIENT_CONNACK` 对**每次客户端连接**都会触发一次 POST，接收器不在线时每次连接就多出一次失败的 HTTP 连接加两行同步日志（这块板子开了 `CONFIG_LOG_MODE_IMMEDIATE`）。实测:开着 webhook 跑一轮 `mqtt_v5` 出现了 **97 次**失败的 POST,而该组里那个按进程启动顺序决出胜负的竞态子测试,三轮全部失败;关掉后恢复为"重试后通过"。所以这里默认关闭,`prj.conf` 里也是关的。
-
 ### 2. 编译
 
 `EXTRA_CONF_FILE` 相对 app 目录解析：
@@ -215,15 +204,15 @@ west build -b esp32s3_devkitc/esp32s3/procpu -d build/esp32s3_nanomq \
     demo/nanomq_esp32s3_broker -- -DEXTRA_CONF_FILE=local.conf
 ```
 
-构建成功后输出的内存报告（本文验证的配置，已启用 MQTT/REST/WS/webhook）：
+构建成功后输出的内存报告（本文验证的配置，已启用 MQTT/REST/WS）：
 
 ```
 Memory region         Used Size  Region Size  %age Used
-           FLASH:      962100 B   16776960 B      5.73%
+           FLASH:      962052 B   16776960 B      5.73%
      iram0_0_seg:       54028 B     415492 B     13.00%
      dram0_0_seg:      314008 B     399108 B     78.68%
-     irom0_0_seg:      685168 B        32 MB      2.04%
-     drom0_0_seg:      831028 B        32 MB      2.48%
+     irom0_0_seg:      685088 B        32 MB      2.04%
+     drom0_0_seg:      830980 B        32 MB      2.48%
     ext_dram_seg:     5152752 B        32 MB     15.36%
 ...
 Successfully created ESP32-S3 image.
@@ -402,7 +391,7 @@ python3 -m pip install paho-mqtt requests
 
 系统还需提供 mosquitto 命令行客户端（`mosquitto_pub` / `mosquitto_sub`），Debian/Ubuntu 上为 `mosquitto-clients`，Fedora 上为 `mosquitto`。
 
-`--list` 可查看全部 9 个测试组：
+`--list` 可查看全部测试组：
 
 ```sh
 python3 demo/zephyr_broker/function_test.py --list
@@ -411,18 +400,8 @@ python3 demo/zephyr_broker/function_test.py --list
 针对实机运行（`--no-manage` 表示 broker 已在运行，不由 runner 管理）：
 
 ```sh
-python3 demo/zephyr_broker/function_test.py --no-manage --addr <board-ip> --webhook
+python3 demo/zephyr_broker/function_test.py --no-manage --addr <board-ip>
 ```
-
-`--webhook` 表示被测 broker 编译进了 webhook 转发器（实机需先在 `local.conf` 里配置，见前文）；`webhook_smoke` 组会自行启动接收器并断言事件到达。不加该参数时该组报 **SKIP** 而不是失败——因为 broker 侧无法被查询（REST 的 `/configuration/webhook` 路由没有实现，而启动横幅 `Hook service started` 是 DEBUG 级日志，实机构建不输出）。
-
-`webhook_smoke` 组会**自己占用 18080 端口**并在结束时关掉接收器，因此运行前请先停掉任何遗留的接收器——否则它会以「端口已被占用」直接报错（broker 侧的目标 URL 是编译期固定的，端口换不掉）。想要手工观察事件，可在两组之间自行启动接收器：
-
-```sh
-python3 demo/zephyr_broker/hook_receiver.py --port 18080 --out /tmp/webhook.log
-```
-
-转发是 fire-and-forget、**不重试**：接收器未就绪时发出的那条事件就此丢失。默认配置下 webhook 是关闭的，所以正常跑整套时不会有任何 POST；只有当你为了验证 webhook 而打开了它、又没让接收器在线时，才会在 broker 日志里看到反复的 `webhook_inproc.c ... HTTP aio result error : Connection refused`——这是预期行为，不影响 broker 运行，但如前所述会拖慢计时敏感的测试组。
 
 也可只运行指定测试组：
 
@@ -471,19 +450,9 @@ RESULT: pass=8 fail=0 skip=1
 | `rest_get` | REST GET 全部路由 | 3.3s |
 | `ws_v311` | MQTT 3.1.1 over WebSocket | 268.8s |
 | `ws_v5` | MQTT 5 over WebSocket | 15.9s |
-| `webhook_smoke` | 接收器收到 `client_connack` + `message_publish` | 见下 |
 | `capacity` | 12 个并发 CONNECT + QoS1 回环 | 14.7s |
 | `ws_abort` | WebSocket 连接异常中止时的连接池稳定性 | 26.4s |
 | `survival` | 上游 `attack.py` 的缩比负载/会话 churn | 40.7s |
-
-上表是**默认配置**（webhook 关闭）下的结果，因此 `webhook_smoke` 报 SKIP 而非失败——broker 侧无法被查询（REST 的 `/configuration/webhook` 路由没有实现，而启动横幅 `Hook service started` 是 DEBUG 级日志，实机构建不输出），只能由调用方用 `--webhook` 声明。打开 webhook 后单独跑该组的结果：
-
-```
-$ python3 demo/zephyr_broker/function_test.py --no-manage --addr 192.168.1.10 \
-      --webhook --group webhook_smoke
-[1/1] webhook_smoke  PASS  (2.7s)
-RESULT: pass=1 fail=0
-```
 
 runner 会自动调整参数：它先测量到 broker 的 TCP 往返时延（本机环回低于 1 ms，实机经 Wi-Fi 实测 14–600 ms），判定为非本机后默认切换至 `--time-scale 4 --retry 2`。前者用于拉长 CI 脚本中按本机时延设定的 sleep，后者用于应对其中两个子测试的固有竞态。
 
@@ -555,7 +524,7 @@ net_mgmt_add_event_callback(&dhcp_cb);
 
 **配置来源。** 通用版 NanoMQ 从 `nanomq.conf` 文件读取配置；Zephyr 版采用**内嵌最小 conf**——由 `conf_init()` 的内置默认值加上启动代码直接设置关键字段（如监听地址），绕过配置文件解析。`conf` 结构体的语义保持不变，仅配置来源由文件换为内存构造。
 
-**功能裁剪。** 外围功能（REST、webhook、rule 引擎、bridge 等）的策略是**全量编译 + 运行时开关**，而非编译期裁剪，以保证同一份源码在两个平台行为一致。以下能力在本版本中不可用或未经验证：
+**功能裁剪。** 外围功能（REST、rule 引擎、bridge 等）的策略是**全量编译 + 运行时开关**，而非编译期裁剪，以保证同一份源码在两个平台行为一致。以下能力在本版本中不可用或未经验证：
 
 | 能力 | 状态 |
 |---|---|
