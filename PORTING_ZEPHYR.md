@@ -863,7 +863,7 @@ DNS 整个关掉。
 **顺带记录(非本类,未修)**:REST `/api/v4/brokers/` 的 `uptime` 字段恒为
 `15360 Hours` 之类的离谱值(整数溢出嫌疑),与时钟播种无关。
 
-### §22-5 WS 中止连接泄漏:约 25 次耗尽连接池(2026-09-11 查明,未修)
+### §22-5 WS 中止连接泄漏:约 25 次耗尽连接池(2026-09-11 查明并修复)
 
 **现象**:对 8083 反复做"WebSocket 握手成功 → 立刻关闭"(**不发 MQTT
 CONNECT**),约 25 次后 broker 的**全部监听面**停止服务:1883/8081/8083 对新
@@ -887,29 +887,80 @@ CONNECT**),约 25 次后 broker 的**全部监听面**停止服务:1883/8081/808
 即**泄漏专属于"握手完成、但 MQTT 协商从未进行就断开"这条路径**,而不是
 "WS 连接多了就会死"。
 
-**推断(未证实到具体代码)**:每次这类中止连接泄漏一份 socket/net_context,
-`CONFIG_NET_MAX_CONTEXTS=32` 减去监听器与在用连接,约 25 次即耗尽。
+#### 根因(已插桩证实)
 
-**候选泄漏点**(仅代码审阅,未插桩证实)——`wstran_accept_cb`
-(`nng/src/sp/transport/mqttws/nmq_websocket.c:1681`):
+`nng/src/sp/transport/mqttws/nmq_websocket.c` 的 `wstran_pipe_recv_cb()`
+`reset:` 分支。ws 传输在 **nng 接管之前**就为连接建好了 `ws_pipe`:握手一完成
+`wstran_accept_cb()` 就 `wstran_pipe_alloc()` 并置 `p->ep_aio = uaio`(监听器
+的 accept aio),此刻该 aio 同时充当首个 MQTT 报文的接收方(`done:` 处的
+`uaio = p->ep_aio`)。只要 peer 在 MQTT CONNECT 之前断开,recv 先失败,于是:
 
-1. accept 成功分支中,若 `uaio == NULL`(没有等待中的用户 accept aio),取到的
-   `ws`(已 accept 的 stream)**既没 close 也没 free**;
-2. `wstran_pipe_alloc()` 失败时只 `nng_stream_close(ws)`,**没有
-   `nng_stream_free(ws)`** —— 而 stream 对象与底层 socket 是由 free 释放的
-   (对照:正常路径 `wstran_pipe_fini` 里有 `nng_stream_free(p->ws)`)。
+1. `reset:` 看到 `p->ep_aio != NULL` → 按原注释的意图
+   `nni_aio_finish_error(p->ep_aio, NNG_ECONNABORTED)`(避免监听器把
+   `NNG_ECLOSED` 误判成"监听器自己被关");
+2. 但**accept aio 以错误收尾 ⇒ nng 永远不会把这个 ws_pipe 变成 `nni_pipe`**
+   ⇒ `wstran_pipe_init()` 不执行、`p->ep_aio` 不被清空、**没有任何人会调用
+   `wstran_pipe_fini()`**;
+3. 于是 `ws_pipe` 结构体、其 stream 及底层 socket 一起泄漏 —— 每条中止连接
+   泄漏一个 `net_context`。
 
-**已排除的猜测**:①"`wstran_pipe_fini` 漏了 `nng_stream_free`"不成立 —— 它有;
-②§7-20 记录的 `user_rxaio` 完成路径修复**确实在当前代码里**。
+**插桩证据**(qemu_x86,29 条中止连接,`ctx` = 在用 `net_context` 数):
+`accept_cb: pipe_ok` × 29,`recv_cb reset … ep_aio=0x… uaio=0` × 29,
+**`pipe_fini` × 0**;`ctx` 从 4 单调涨到 **32**(= `CONFIG_NET_MAX_CONTEXTS`)
+后握手开始 RST。修复后同样 400 条中止连接:`ctx` 只在 4↔5 间摆动,
+结束回到 **4**,`pipe_ok` 与 `pipe_fini` 各 400,一一对应。
+
+**曾怀疑并已证伪**(§22-5 旧版记的两个候选点,**实测从未进入这两个分支**):
+①`wstran_accept_cb` 的 `uaio == NULL` 分支丢弃 stream —— 实测该分支执行 0 次;
+②`wstran_pipe_alloc()` 失败时只 close 不 free —— 同样是 0 次。另外旧版已排除
+"`wstran_pipe_fini` 漏了 `nng_stream_free`"。真正的分支是 `ep_aio != NULL`。
+
+#### 修复
+
+`wstran_pipe_recv_cb()` 在 `ep_aio != NULL` 分支置 `orphan`,并在**函数尾部**
+(不再触碰 `p` 之后)用 `nni_reap(&ws_pipe_reap_list, p)` 交回 reaper 线程回收。
+必须走 reap 而不能就地 `wstran_pipe_fini()`:后者会 `nni_aio_free(p->rxaio)`,
+而此刻正在执行的**就是这个 aio 的回调**,就地释放会自等待。
+
+`wstran_pipe_fini()` 对"未 init 的 pipe"是安全的,无需新增清理路径:
+`p->npipe` / `p->tmp_msg` / `p->ws_param` / `p->qos_buf` 均为零值且各自有
+NULL 判断(或 `nni_free`/`nni_msg_free` 接受 NULL),`nni_lmq_flush/fini` 对零值
+lmq 是空操作;既有代码本来就会在这种状态下调用它们(`nni_lmq_flush` 在
+`reset:`、`wstran_pipe_fini` 在 `wstran_pipe_alloc` 失败路径)。
+
+提交:nng 子模块 `FIX [mqttws] reap the pipe when a ws peer drops before MQTT CONNECT`。
+
+#### 验证
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| qemu_x86,400 次中止握手 | 第 30 次起永久失败 | **400/400 通过** |
+| ESP32-S3 实机,200 次中止握手 | 第 26/27 次起三面全停 | **200/200 通过** |
+| `function_test.py --group ws_abort`(新增,实机) | FAIL(第 30 次) | **PASS**(30.3s) |
+| 全量功能套件(qemu_x86,8 组) | — | `pass=8 fail=0` |
+| 全量功能套件(实机,7 组) | — | `pass=7 fail=0` |
+
+实机那轮逐组:`mqtt_v311` 64.1s、`mqtt_v5` 321.6s、`rest_get` 3.0s、`ws_v311`
+289.4s、`ws_v5` 16.4s、`capacity` 12.2s、`ws_abort` 30.3s。其中 `mqtt_v5` 是
+§22-3(g) 那个**上游脚本固有竞速**,由 `--retry` 兜过(与前几次实测一致),
+**与本修复无关**:该子测试全程只走 :1883 的 mosquitto CLI,而本次改动只落在
+ws 传输的 accept/teardown 路径。
+
+**回归测试**:`function_test.py` 新增 `ws_abort` 组 —— 先做 60 次"握手即断"
+(默认,可用 `ZF_WS_ABORT_N` 调),再要求 1883 的 MQTT CONNECT 拿到 CONNACK、
+8083 的完整 MQTT-over-WS 会话拿到 CONNACK 才算通过。**注意不能只用裸 TCP
+connect 判活**:Zephyr 监听器在 broker 已无法 accept 时仍会从 backlog 完成
+TCP 握手,裸 connect 照样成功,必须驱动真实会话。
 
 **本缺陷与 ws 功能测试的关系**:`ws_v311` / `ws_v5` 走的是**完整 MQTT-over-WS**
 (每次都发 CONNECT),实测在干净板子上**都能通过**(287.4s / 15.3s),不属于本条
 路径。曾有"ws 组卡住 = 本缺陷发作"的判断,已证伪。
 
-**影响与建议**:中止的 WS 连接(端口扫描、客户端握手后立刻崩溃/超时、只做
-握手不建 MQTT 的健康检查)足以打死 broker 且不自愈。修复需在 nng 侧给上述
-分支补上释放;在修好之前,对 WS 端口做健康探测请走**完整的 MQTT-over-WS
-连接**,不要只做握手。
+**已知残留(良性,不随 N 增长)**:修复后 `ctx` 在**背靠背**压测中会高于基线
+4 —— 实测 N=200 峰值 8、N=400 峰值 7,静置 10s 后为 7;这是 reaper 线程滞后
+加上 TCP TIME_WAIT 在途连接所致(**未逐一定性**)。判据是它与 N **无关**:
+N=50 与 N=400(=8 倍)峰值同为 7。改为 700ms 间隔的慢速压测后,`ctx` 全程
+恒为 4。原缺陷是**每条中止连接 +1 且永不回落**,与此有本质区别。
 
 ### §22-3-old 历史记录(保留)
 

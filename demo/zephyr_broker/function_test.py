@@ -23,6 +23,7 @@ Groups (see `--list`):
     ws_v5          CI .github/scripts/ws_v5_test.py     :8083
     webhook_smoke  hook_receiver.py + paho              :1883/:18080
     capacity       12 concurrent CONNECTs + QoS1 echo   :1883
+    ws_abort       aborted ws handshakes, pool intact   :8083/:1883
     survival       survival_test.py (scaled attack.py)  :1883
 
 Usage (outer host, from anywhere in the repo):
@@ -92,6 +93,8 @@ GROUPS = [
      "hook_receiver.py receives client_connack + message_publish"),
     ("capacity", 180,
      "12 concurrent CONNECTs + QoS1 echo (connection-pool regression)"),
+    ("ws_abort", 180,
+     "aborted nmq-ws handshakes must not leak the connection pool"),
     ("survival", 300,
      "survival_test.py — scaled-down attack.py load/session churn"),
 ]
@@ -398,6 +401,102 @@ def group_rest_get(addr: str, env: dict) -> None:
         "websocket.url does not carry port %d: %r" % (WS_PORT, ws)
 
 
+def ws_handshake_abort(addr: str, port: int, timeout: float = 5.0) -> str:
+    """One bare WebSocket handshake, dropped the moment the 101 arrives.
+
+    Deliberately sends no MQTT CONNECT.  The broker's ws transport creates
+    its pipe as soon as the handshake completes, i.e. before nng owns it —
+    that window is where the leak used to live.
+    """
+    import base64
+
+    key = base64.b64encode(os.urandom(16)).decode()
+    s = socket.socket()
+    s.settimeout(timeout)
+    try:
+        s.connect((addr, port))
+        s.sendall((
+            "GET /mqtt HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: %s\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "Sec-WebSocket-Protocol: mqtt\r\n"
+            "\r\n" % (addr, port, key)).encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        return buf.split(b"\r\n", 1)[0].decode(errors="replace").strip()
+    finally:
+        s.close()
+
+
+def mqtt_tcp_connack(addr: str, timeout: float = 10.0) -> bytes:
+    """Minimal MQTT 3.1.1 CONNECT on :1883; returns the first two bytes."""
+    s = socket.socket()
+    s.settimeout(timeout)
+    try:
+        s.connect((addr, MQTT_PORT))
+        # CONNECT, rem len 12, "MQTT" v4, clean-session, keepalive 60, empty id.
+        s.sendall(b"\x10\x0c\x00\x04MQTT\x04\x02\x00\x3c\x00\x00")
+        return s.recv(4)[:2]
+    finally:
+        s.close()
+
+
+def group_ws_abort(addr: str, env: dict) -> None:
+    """Aborted WebSocket handshakes must not leak the connection pool.
+
+    Handshake-then-close connections used to leak one net_context each and
+    exhaust CONFIG_NET_MAX_CONTEXTS (32) after ~29 of them, which killed
+    every listener on the broker permanently — see PORTING_ZEPHYR.md §22-5.
+    This group aborts well past that threshold, then proves all three
+    listeners still serve.
+    """
+    n = int(env.get("ZF_WS_ABORT_N", "60"))
+    for i in range(n):
+        try:
+            status = ws_handshake_abort(addr, WS_PORT)
+        except OSError as e:
+            raise AssertionError(
+                "abort %d/%d: handshake died with %s — connection pool "
+                "exhausted?" % (i + 1, n, e))
+        assert status.startswith("HTTP/1.1 101"), (
+            "abort %d/%d: handshake failed: %r" % (i + 1, n, status))
+
+    # A bare connect() is not enough here: a Zephyr listener still answers
+    # the TCP handshake from the backlog once the broker can no longer
+    # accept, so drive real sessions instead.
+    assert mqtt_tcp_connack(addr) == b"\x20\x02", \
+        "no CONNACK on :1883 after %d aborted handshakes" % n
+
+    import paho.mqtt.client as mqtt
+    from paho.mqtt.client import CallbackAPIVersion
+
+    got = threading.Event()
+    seen: dict = {}
+    c = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION1,
+                    client_id="zf-ws-abort", protocol=mqtt.MQTTv311,
+                    transport="websockets")
+    c.ws_set_options(path="/mqtt")
+    c.on_connect = lambda cl, u, flags, rc, props=None: (
+        seen.__setitem__("rc", rc), got.set())
+    c.connect(addr, WS_PORT, 30)
+    c.loop_start()
+    try:
+        assert got.wait(20), (
+            "no CONNACK on :%d after %d aborted handshakes "
+            "(ws listener dead?)" % (WS_PORT, n))
+        assert seen["rc"] == 0, "CONNACK rc=%r" % (seen["rc"],)
+    finally:
+        c.loop_stop()
+        c.disconnect()
+
+
 def group_ws_v311(addr: str, env: dict) -> None:
     """Upstream CI WebSocket 3.1.1 suite.
 
@@ -599,6 +698,7 @@ GROUP_FUNCS = {
     "ws_v5": group_ws_v5,
     "webhook_smoke": group_webhook_smoke,
     "capacity": group_capacity,
+    "ws_abort": group_ws_abort,
     "survival": group_survival,
 }
 
