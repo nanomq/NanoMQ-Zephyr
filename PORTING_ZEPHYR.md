@@ -1038,14 +1038,37 @@ CONNECT/DISCONNECT、6 路并发)、同一固件,**唯一变量是 webhook 开�
 | webhook **开** + 接收端在线 | 400(提前中止) | **275** | 约第 200 次起卡死,未恢复 |
 | webhook **关**(对照) | 600 | **13** | 全程存活 |
 
-即**确实与 webhook 相关**(21 倍失败率 + 硬卡死)。但机制**未定性**:串口里没有
-`cannot allocate`/`net_context` 之类的池耗尽记录,`tcp_dial_cancel` 只有 5 次、
-成功 POST 有 140 条,都不足以解释。**不排除是 TIME_WAIT 与 webhook 每连接一次
-HTTP 连接的叠加**,但未证实。
+即**确实与 webhook 相关**(21 倍失败率 + 硬卡死)。机制**已定位到崩溃点**
+(2026-09-11 续查,见下),但**根因未修**。
 
-**处置**:按"确认与 webhook 相关即暂不追"的结论**挂起**。两个 demo 的 webhook
-默认关闭(§22-6 的开关建议),因此**默认配置不受影响**——webhook 关时实机整套
-`pass=8 fail=0 skip=1`、qemu 同样。若日后要追,起点是这个放大脚本与上面 A/B 表。
+**续查结论:不是池耗尽,是 net_pkt 池被写坏后崩溃。**
+① 接上串口复现,崩溃现场为 Xtensa 异常 `EXCCAUSE 28 (load prohibited)`,
+`PC` 经 addr2line 解析落在 **`k_mem_slab_alloc`(`kernel/mem_slab.c:245`)** ——
+即 `slab->free_list = *(char **)(slab->free_list)` 解引用了野指针;
+② 用崩溃时的 `A2`(= slab 指针 `0x3fc97210`)对 ELF 查符号,该 slab 是
+**`rx_pkts`**(Zephyr 的 net_pkt 接收池,`CONFIG_NET_PKT_RX_COUNT=32`)。
+即**有 net_pkt 被重复释放/释放后仍在使用**,把该 slab 的空闲链表写坏,
+下一次分配即崩。崩溃后 broker 再不自愈(端口仍答 TCP、REST 000)。
+
+**已用实验排除的三个直觉方向**(都实测过,别再重走):
+- **不是排空缺陷**:那一轮接收端在线、POST 成功,故障路径没被走到;而排空修复
+  已在固件里。
+- **不是 webhook worker 数**:`web_hook.pool_size` 从默认 32 调到 2,同样崩
+  (`pool_size` 每个 worker 一条自己的 HTTP 连接,直觉上很像,但不是它)。
+- **不是 net_context 不够**:把 `NET_MAX_CONTEXTS/NET_MAX_CONN` 从 32 提到 64,
+  照样在第 200 次连接左右崩;且 ctx 峰值只到 **39/64**,根本没顶到上限。
+  对照组(webhook 关)同负载下 ctx 峰值 14–24、结束时回落到 5,**不泄漏**。
+
+**归属判断**:webhook 关、同样 600 次连接 churn 下**全程存活**;开则崩。故触发
+条件是 webhook 引入的额外流量,但**写坏 net_pkt 的地方在 Zephyr 网络栈 /
+ESP32 Wi-Fi 驱动的收包路径**,不在 NanoMQ 侧——修复需要沿着 net_pkt 的
+分配/释放归属去查(建议开 `CONFIG_NET_PKT_*` 相关调试或给 net_pkt 加
+owner 标记),属于与前述几处不同量级的排查。
+
+**处置**:两个 demo 的 webhook 默认关闭(§22-6 的开关建议),因此**默认配置不受
+影响**——webhook 关时实机整套 `pass=8 fail=0 skip=1`、qemu 同样。放大脚本
+(`/tmp/connect_hammer.py`,600 次连接 / 6 路并发)、A/B 表与上面这条崩溃链
+是续查的起点。
 
 **排查教训**:这次是"启用一个默认关闭的功能"暴露出既有缺陷。判断"是不是我
 改坏的"靠的是**对照实验**(接收端开/关各跑一次、webhook 开/关各跑一次),
