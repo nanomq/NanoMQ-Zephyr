@@ -7,8 +7,9 @@ ESP32-S3-WROOM-1-N16R16V module (16 MB flash + 16 MB octal PSRAM).
 
 Sibling of [demo/zephyr_broker](../zephyr_broker/) (qemu_x86): same app
 sources and NanoNNG ExternalProject build, different board/networking
-layer.  Feature surface here: MQTT over TCP (:1883) + REST API (:8081) —
-WS/webhook/DEBUG log stay off.
+layer.  Feature surface here matches the qemu demo: MQTT over TCP (:1883) +
+REST API (:8081) + MQTT over WebSocket (:8083/mqtt) — webhook and the DEBUG
+log stay off.
 
 ## Board target
 

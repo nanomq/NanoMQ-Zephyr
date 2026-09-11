@@ -295,9 +295,9 @@ iow32(dev, RCTL, RCTL_EN | RCTL_MPE | RCTL_BAM | DT_INST_PROP(inst, rdmts) << RD
   (默认 `-rtc base=utc`)播种;S3 实机无 RTC,改由 SNTP 播种(§22-4)。
   Zephyr 无 TZ 数据库,显示恒为 UTC;时区仍需自行处理
 - 无文件系统:配置/日志/持久会话均无落盘;`$SYS` 只服务运行时
-- 目标板:qemu_x86(32 位)验证;同 ExternalProject 已含 32 位 ARM 原子回退
-  (`NNG_ZEPHYR_NO_STDATOMIC`),但**未在真实板卡验证**(网络驱动、中断、内存
-  预算均需重验)
+- 目标板:qemu_x86(32 位)与 **ESP32-S3 实机**(xtensa,见 §22)均已验证;同
+  ExternalProject 已含 32 位 ARM 原子回退(`NNG_ZEPHYR_NO_STDATOMIC`),但
+  **未在真实 ARM 板卡验证**(网络驱动、中断、内存预算均需重验)
 - qemu_x86 MMU 分支 → arena 静态 1 MB;小内存目标板需重算(见 §9)
 
 ## 9. 移植功能清单与验证状态(2026-09 复核)
