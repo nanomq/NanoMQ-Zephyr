@@ -13,19 +13,35 @@ config BROKER_LOG_DEBUG
 	  runs (less noise, fewer cycles in log formatting).
 
 config BROKER_REST_API
-	bool "Enable the NanoMQ REST API (HTTP tcp:8081, auth off)"
+	bool "Enable the NanoMQ REST API (HTTP tcp:8081, Basic auth)"
 	help
-	  Sets conf http_server.enable / auth_type=NONE_AUTH in main.c so the
-	  broker serves /api/v4 over plain HTTP.  Requires an extra SLIRP
-	  hostfwd for tcp:8081 (see prj.conf) to be reachable from the host.
+	  Sets conf http_server.enable / auth_type=BASIC plus the admin/public
+	  credentials in main.c, so the broker serves /api/v4 over plain HTTP
+	  behind Basic auth.
+
+	  Basic over plain HTTP is base64, not encryption — TLS is compiled
+	  out of the Zephyr NanoNNG.  Keep this off untrusted networks.
 
 config BROKER_WEBHOOK
-	bool "Enable the NanoMQ webhook forwarder (POST to conf->web_hook.url)"
+	bool "Enable the NanoMQ webhook forwarder (POST to BROKER_WEBHOOK_URL)"
 	help
 	  Sets conf web_hook.enable, an inproc hook channel (Zephyr has no IPC
-	  transport) and one MESSAGE_PUBLISH rule on "test/#" so published
-	  messages are POSTed to the receiver URL (guest reaches the QEMU host
-	  alias 10.0.2.2).  Run a receiver on that port before exercising it.
+	  transport) and two rules (MESSAGE_PUBLISH on "hook/#", CLIENT_CONNACK).
+	  The receiver URL comes from BROKER_WEBHOOK_URL below; leave that empty
+	  and the forwarder stays off.
+
+config BROKER_WEBHOOK_URL
+	string "Webhook receiver URL"
+	depends on BROKER_WEBHOOK
+	default ""
+	help
+	  Where the broker POSTs event JSON, e.g. "http://192.168.1.5:18080/".
+	  Must be the LAN address of the machine running hook_receiver.py, and
+	  reachable from the board.  Set it in local.conf (alongside the Wi-Fi
+	  credentials) since it depends on your network:
+
+	    CONFIG_BROKER_WEBHOOK=y
+	    CONFIG_BROKER_WEBHOOK_URL="http://192.168.1.5:18080/"
 
 config BROKER_WS
 	bool "Enable the WebSocket listener (MQTT over RFC6455, tcp:8083)"

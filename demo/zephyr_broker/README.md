@@ -243,24 +243,68 @@ exercisable (Kconfig options wired to main.c overrides, see
 
 REST is served on `tcp:8081` (the second of the three SLIRP hostfwd entries
 in [prj.conf](prj.conf))
-with auth off.  curl exists on the outer host only — use the container IP
-(see the table in "Run"):
+behind **Basic auth**, default `admin`/`public` (set in `main.c`; same
+credentials as `etc/nanomq.conf` and the upstream docs).  Note this is
+base64 over plain HTTP, not encryption — TLS is not in the Zephyr NanoNNG
+build — so keep it off untrusted networks.  curl exists on the outer host
+only — use the container IP (see the table in "Run"):
 
 ```sh
-curl -s http://<container-ip>:8081/api/v4/clients   # top-level key is "data"
+curl -s -u admin:public http://<container-ip>:8081/api/v4/clients  # key is "data"
 ```
 
-Webhook events are POSTed to the QEMU-host alias `10.0.2.2`.  Run
-[`hook_receiver.py`](hook_receiver.py) there before publishing to
-`test/#` to see them:
+Override the credentials for the suite with `--rest-user`/`--rest-pass`.
+
+Webhook is **off by default** here too (the two `CONFIG_BROKER_WEBHOOK*`
+lines in [prj.conf](prj.conf) are commented out).  The `CLIENT_CONNACK` rule
+fires on every client connect, so leaving the forwarder on with no receiver
+listening costs a failed HTTP attempt plus two log lines per connect — that
+measurably perturbs the suite's timing-sensitive subtests
+(PORTING_ZEPHYR.md §22-6).  Turn it on only when you want to exercise it:
 
 ```sh
-docker exec -d zephyr-tap python3 /workdir/nanomq/demo/zephyr_broker/hook_receiver.py \
-    --port 18080 --out /tmp/webhook.log
+# uncomment CONFIG_BROKER_WEBHOOK / CONFIG_BROKER_WEBHOOK_URL in prj.conf,
+# or keep prj.conf pristine and use an overlay:
+west build -b qemu_x86 -d build/zephyr_broker demo/zephyr_broker -- \
+    -DEXTRA_CONF_FILE=webhook.conf      # holding the same two lines
 ```
+
+The URL matters, not the `BROKER_WEBHOOK` bool: main.c enables the forwarder
+only when it is non-empty, so an empty URL is how the demo keeps it off.
+Events are POSTed to the QEMU-host alias `10.0.2.2` — the machine running
+qemu itself — so the receiver runs **on that machine** (no container
+round-trip).  To watch events by hand, start it before publishing to
+`hook/#`:
+
+```sh
+python3 demo/zephyr_broker/hook_receiver.py --port 18080 --out /tmp/webhook.log
+```
+
+Stop it again before running the suite: the `webhook_smoke` group starts its
+own receiver and needs port 18080 to itself, and it will refuse to run if
+something is already listening there (the broker's target URL is a build-time
+setting, so the port cannot be moved out of the way).
 
 One event per connect (`client_connack` — clientid, proto_ver, keepalive)
-and one per `test/#` publish (`message_publish` — ts, topic, qos, payload).
+and one per `hook/#` publish (`message_publish` — ts, topic, qos, payload):
+
+```
+{"proto_ver": 4, "keepalive": 30, "conn_ack": "success", "username": "undefined", "clientid": "zf-webhook-pub", "action": "client_connack"}
+{"ts": 1789117395540, "topic": "hook/webhook", "retain": false, "qos": 1, "action": "message_publish", "from_username": "undefined", "from_client_id": "zf-webhook-pub", "payload": "zf-webhook-1789117396-0"}
+```
+
+Re-run it end to end with:
+
+```sh
+python3 demo/zephyr_broker/function_test.py --group webhook_smoke --webhook \
+    --no-manage --addr 127.0.0.1
+```
+
+`--webhook` tells the suite the broker has the forwarder compiled in; it
+then starts the receiver itself and asserts both events arrive.  Without the
+flag the group reports SKIP (the broker cannot be asked: the REST
+`/configuration/webhook` route has no handler, and the "Hook service
+started" banner is a DEBUG-level line the board builds do not emit).
 
 ## Functional test suite (`function_test.py`)
 
@@ -288,8 +332,9 @@ python3 demo/zephyr_broker/function_test.py --list           # groups + timeouts
 | `rest_get` | REST GET surface on :8081 — 7 routes, plus `/configuration/websocket` mirroring the runtime WS conf | self-written |
 | `ws_v311` | MQTT 3.1.1 over `nmq-ws://` on :8083 | CI `ws_test.py` |
 | `ws_v5` | MQTT 5 over WS — properties, topic alias, session expiry | CI `ws_v5_test.py` |
-| `webhook_smoke` | `hook_receiver.py` receives `client_connack` + `message_publish` | self-written |
+| `webhook_smoke` | `hook_receiver.py` receives `client_connack` + `message_publish` — needs `--webhook`, else SKIP | self-written |
 | `capacity` | 12 concurrent CONNECTs + a QoS1 echo — regression for the connection-pool limit above | self-written |
+| `ws_abort` | 60 handshake-then-close ws connections, then a real MQTT-over-WS session — guards the accept-path leak (PORTING_ZEPHYR.md §22-5) | self-written |
 | `survival` | scaled-down `attack.py` load/session churn + post-churn echo probe | [`survival_test.py`](survival_test.py) |
 
 How the CI modules are reused without touching them: every group runs in its

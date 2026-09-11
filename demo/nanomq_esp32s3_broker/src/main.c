@@ -466,14 +466,24 @@ main(void)
 #endif
 
 #ifdef CONFIG_BROKER_REST_API
-	// REST API on plain HTTP, no auth.  broker() calls start_rest_server()
-	// itself (apps/broker.c); the http server is a separate TCP listener
-	// (conf default ip 0.0.0.0, port 8081) bridged into the broker socket
-	// over inproc REQ/REP.  conf_init defaults auth_type to BASIC
-	// (admin/public), which would reject our host-side curl without
-	// credentials — test with NONE_AUTH.
+	// REST API on plain HTTP with Basic auth.  broker() calls
+	// start_rest_server() itself (apps/broker.c); the http server is a
+	// separate TCP listener (conf default ip 0.0.0.0, port 8081) bridged
+	// into the broker socket over inproc REQ/REP.
+	//
+	// auth_type defaults to BASIC, but conf_http_server_init() leaves
+	// username/password NULL — and basic_authorize() (rest_api.c) does
+	// strlen() on both, so the credentials must be filled in here or the
+	// first REST request dereferences NULL.  admin/public matches
+	// etc/nanomq.conf and the upstream docs.
+	//
+	// NB: Basic over plain HTTP is base64, not encryption — TLS is
+	// compiled out of the Zephyr NanoNNG, so keep this off untrusted
+	// networks regardless.
 	nmq_conf->http_server.enable    = true;
-	nmq_conf->http_server.auth_type = NONE_AUTH;
+	nmq_conf->http_server.auth_type = BASIC;
+	nmq_conf->http_server.username  = nng_strdup("admin");
+	nmq_conf->http_server.password  = nng_strdup("public");
 #endif
 
 #ifdef CONFIG_BROKER_WS
@@ -492,25 +502,32 @@ main(void)
 	// client (fire-and-forget; slow receivers never block the broker).
 	// The default hook channel is ipc:///tmp/... — Zephyr has no IPC
 	// transport (NNG_TRANSPORT_IPC=OFF), so it must be inproc.
-	// 10.0.2.2 is the SLIRP alias for the host running qemu: run a POST
-	// receiver there (see demo README) before publishing to "test/#".
-	nmq_conf->web_hook.enable = true;
-	nmq_conf->web_hook.url    = nng_strdup("http://10.0.2.2:18080/");
-	nmq_conf->hook_ipc_url    = nng_strdup("inproc://nanomq_hook");
+	//
+	// The receiver URL is a build-time setting (CONFIG_BROKER_WEBHOOK_URL)
+	// and has no sensible default on a real board: it must be the LAN
+	// address of the machine running hook_receiver.py, so set it in
+	// local.conf alongside the Wi-Fi credentials.  With the URL left empty
+	// the forwarder stays disabled rather than POSTing into the void.
+	if (strlen(CONFIG_BROKER_WEBHOOK_URL) > 0) {
+		nmq_conf->web_hook.enable = true;
+		nmq_conf->web_hook.url =
+		    nng_strdup(CONFIG_BROKER_WEBHOOK_URL);
+		nmq_conf->hook_ipc_url = nng_strdup("inproc://nanomq_hook");
 
-	conf_web_hook_rule *hook_msg =
-	    nng_zalloc(sizeof(conf_web_hook_rule));
-	hook_msg->event = MESSAGE_PUBLISH; // fire on every publish
-	hook_msg->topic = nng_strdup("test/#");
-	conf_web_hook_rule *hook_conn =
-	    nng_zalloc(sizeof(conf_web_hook_rule));
-	hook_conn->event = CLIENT_CONNACK; // fire when a client connects
+		conf_web_hook_rule *hook_msg =
+		    nng_zalloc(sizeof(conf_web_hook_rule));
+		hook_msg->event = MESSAGE_PUBLISH; // fire on every publish
+		hook_msg->topic = nng_strdup("hook/#");
+		conf_web_hook_rule *hook_conn =
+		    nng_zalloc(sizeof(conf_web_hook_rule));
+		hook_conn->event = CLIENT_CONNACK; // fire when a client connects
 
-	nmq_conf->web_hook.rules =
-	    nng_zalloc(2 * sizeof(conf_web_hook_rule *));
-	nmq_conf->web_hook.rules[0]    = hook_msg;
-	nmq_conf->web_hook.rules[1]    = hook_conn;
-	nmq_conf->web_hook.rule_count  = 2;
+		nmq_conf->web_hook.rules =
+		    nng_zalloc(2 * sizeof(conf_web_hook_rule *));
+		nmq_conf->web_hook.rules[0]   = hook_msg;
+		nmq_conf->web_hook.rules[1]   = hook_conn;
+		nmq_conf->web_hook.rule_count = 2;
+	}
 #endif
 
 #if defined(ENABLE_LOG)

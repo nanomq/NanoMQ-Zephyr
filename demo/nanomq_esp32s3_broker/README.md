@@ -8,8 +8,8 @@ ESP32-S3-WROOM-1-N16R16V module (16 MB flash + 16 MB octal PSRAM).
 Sibling of [demo/zephyr_broker](../zephyr_broker/) (qemu_x86): same app
 sources and NanoNNG ExternalProject build, different board/networking
 layer.  Feature surface here matches the qemu demo: MQTT over TCP (:1883) +
-REST API (:8081) + MQTT over WebSocket (:8083/mqtt) — webhook and the DEBUG
-log stay off.
+REST API (:8081, Basic auth `admin`/`public`) + MQTT over WebSocket
+(:8083/mqtt), plus an optional webhook forwarder.  The DEBUG log stays off.
 
 ## Board target
 
@@ -147,6 +147,69 @@ Run the suite against the board with:
 python3 demo/zephyr_broker/function_test.py --no-manage --addr <board-ip> \
     --group mqtt_v311 --group mqtt_v5 --group rest_get
 ```
+
+The full run, including the webhook group (see below):
+
+```sh
+# terminal 1 — or let the suite start it itself, see below
+python3 demo/zephyr_broker/hook_receiver.py --port 18080 --out /tmp/webhook.log
+
+# terminal 2
+python3 demo/zephyr_broker/function_test.py --no-manage --addr <board-ip> --webhook
+```
+
+### Webhook
+
+Off by default on the board because there is no sensible default receiver
+address: unlike qemu (where `10.0.2.2` is the machine running qemu), a real
+board has to be told a LAN address, at build time.  Add both settings to
+`local.conf` and rebuild:
+
+```conf
+CONFIG_BROKER_WEBHOOK=y
+CONFIG_BROKER_WEBHOOK_URL="http://192.168.1.13:18080/"   # this host
+```
+
+Then re-flash.  The URL must be the machine running `hook_receiver.py`, and
+it changes with the network — the forwarder is fire-and-forget with no
+retry, so an event emitted with the receiver down is lost (the broker logs
+`webhook_inproc.c ... HTTP aio result error : Connection refused`).
+
+**Leave it off unless you are exercising webhook.**  The `CLIENT_CONNACK`
+rule fires on *every* client connect, so with no receiver up each connect
+costs a failed HTTP attempt plus two synchronous log lines.  Measured on
+this board: one `mqtt_v5` run with webhook on produced 97 failed POSTs, and
+the retain subtest — a race decided by process start order — failed all
+three attempts, where it otherwise passes on retry.  `prj.conf` therefore
+leaves the forwarder off; enable it here only when you want to test it.
+
+The two rules are `CLIENT_CONNACK` (every client connect) and
+`MESSAGE_PUBLISH` on **`hook/#`** — a namespace of its own, deliberately
+clear of the `test/#` tree the CI WebSocket suite publishes through, since a
+POST per test message is real load over Wi-Fi.  To exercise it by hand:
+
+```sh
+python3 demo/zephyr_broker/hook_receiver.py --port 18080 --out /tmp/webhook.log &
+mosquitto_pub -h <board-ip> -t 'hook/demo' -m 'hello'
+```
+
+The `webhook_smoke` group takes the port for itself and stops its receiver
+afterwards, so stop any leftover `hook_receiver.py` before running the suite
+— it will otherwise refuse to start with a "something is already listening
+on :18080" error (the broker's target URL is baked in at build time, so the
+port cannot be moved).
+
+Outside that group a receiver is usually *not* running, and `CLIENT_CONNACK`
+still fires on every connect of every group, so expect the broker log to
+show repeated `webhook_inproc.c ... HTTP aio result error : Connection
+refused` lines.  That is harmless: the event is dropped, and the queue
+drains (PORTING_ZEPHYR.md §22-6).
+
+`--webhook` on the suite means "the broker under test has the forwarder
+compiled in": the `webhook_smoke` group then starts the receiver itself and
+asserts both a `client_connack` and a `message_publish` event arrive.  Leave
+the flag off and the group reports SKIP instead of failing, which keeps the
+suite meaningful on a board built without webhook.
 
 The runner tunes itself to the hardware: it measures the TCP round trip to the
 broker and, when that says "not localhost" (loopback and the container bridge

@@ -21,7 +21,7 @@ Groups (see `--list`):
     rest_get       REST GET surface                     :8081
     ws_v311        CI .github/scripts/ws_test.py        :8083
     ws_v5          CI .github/scripts/ws_v5_test.py     :8083
-    webhook_smoke  hook_receiver.py + paho              :1883/:18080
+    webhook_smoke  hook_receiver.py + paho              :1883/:18080 (--webhook)
     capacity       12 concurrent CONNECTs + QoS1 echo   :1883
     ws_abort       aborted ws handshakes, pool intact   :8083/:1883
     survival       survival_test.py (scaled attack.py)  :1883
@@ -77,6 +77,27 @@ REST_PORT = 8081
 WS_PORT = 8083
 WEBHOOK_PORT = 18080
 
+# The demos run the REST API with Basic auth (main.c sets auth_type=BASIC and
+# fills in username/password — conf_http_server_init() leaves them NULL, and
+# basic_authorize() strlen()s both).  These match etc/nanomq.conf and the
+# upstream docs; override with --rest-user/--rest-pass.
+REST_USER = "admin"
+REST_PASS = "public"
+
+# Worker exit code for "this group does not apply to the broker under test"
+# (e.g. webhook_smoke against a broker built without the forwarder).  Distinct
+# from 0/1 so run_worker can tell a skip from a pass without parsing output.
+SKIP_EXIT = 3
+
+
+class SkipGroup(Exception):
+    """Raised by a group that does not apply to the broker under test.
+
+    Not a failure: the group reports SKIP and the suite stays green.  Use it
+    only when the broker is *correctly* configured for what it was asked to
+    do — never to paper over a setup mistake.
+    """
+
 # name, default timeout (s), blurb
 GROUPS = [
     ("mqtt_v311", 420,
@@ -90,7 +111,7 @@ GROUPS = [
     ("ws_v5", 600,
      "CI ws_v5_test.py — MQTT 5 over nmq-ws :8083"),
     ("webhook_smoke", 240,
-     "hook_receiver.py receives client_connack + message_publish"),
+     "hook_receiver.py receives client_connack + message_publish (needs --webhook)"),
     ("capacity", 180,
      "12 concurrent CONNECTs + QoS1 echo (connection-pool regression)"),
     ("ws_abort", 180,
@@ -375,6 +396,9 @@ def group_rest_get(addr: str, env: dict) -> None:
 
     s = requests.Session()
     s.trust_env = False
+    # REST runs with Basic auth on both demos.
+    s.auth = (env.get("ZF_REST_USER", REST_USER),
+              env.get("ZF_REST_PASS", REST_PASS))
     base = "http://%s:%d/api/v4" % (addr, REST_PORT)
     paths = [
         "/nodes/",
@@ -552,40 +576,82 @@ def group_ws_v5(addr: str, env: dict) -> None:
 def group_webhook_smoke(addr: str, env: dict) -> None:
     """Webhook forwarder: one CLIENT_CONNACK + one MESSAGE_PUBLISH event.
 
-    The receiver has to run where SLIRP's 10.0.2.2 alias points, i.e. in
-    the qemu host's namespace — the container.  The demo's rules are
-    CLIENT_CONNACK (all clients) and MESSAGE_PUBLISH on "test/#".
+    The demo's rules are CLIENT_CONNACK (all clients) and MESSAGE_PUBLISH on
+    "hook/#".  The receiver runs right here: on qemu_x86 the broker POSTs to
+    SLIRP's 10.0.2.2 alias, which *is* the machine running qemu; on a real
+    board CONFIG_BROKER_WEBHOOK_URL points at this machine's LAN address.
+
+    Whether the broker has the forwarder compiled in cannot be discovered
+    from the network (the REST /configuration/webhook route has no handler,
+    and the "Hook service started" banner is a DEBUG-level line the board
+    builds do not emit), so the caller declares it with --webhook.  Without
+    that this group skips rather than failing.
     """
+    if not env.get("ZF_WEBHOOK"):
+        raise SkipGroup(
+            "broker webhook not declared — pass --webhook if it was built "
+            "with CONFIG_BROKER_WEBHOOK (qemu_x86 enables it by default; a "
+            "real board needs CONFIG_BROKER_WEBHOOK_URL in local.conf)")
+
     import paho.mqtt.client as mqtt
     from paho.mqtt.client import CallbackAPIVersion
 
-    container = env["ZF_CONTAINER"]
-    workdir = env["ZF_WORKDIR"]
     rec_log = "/tmp/webhook_fz_%d.log" % os.getpid()
     rec_err = rec_log + ".err"
-    docker(container, ["pkill", "-f", "hook_receiver[.]py"])
-    docker(container, ["rm", "-f", rec_log, rec_err])
-    docker(container,
-           ["sh", "-lc",
-            "exec python3 %s/demo/zephyr_broker/hook_receiver.py --port %d "
-            "--out %s >%s 2>&1" % (workdir, WEBHOOK_PORT, rec_log, rec_err)],
-           check=True, detach=True)
+    receiver = str(Path(__file__).resolve().parent / "hook_receiver.py")
+
+    # Refuse to run against somebody else's receiver.  The broker POSTs to a
+    # URL baked in at build time, so the port is fixed and cannot be moved out
+    # of the way — if it is already taken our receiver dies on bind while the
+    # liveness probe keeps succeeding against the squatter, and the group then
+    # reads its own (empty) log and reports a baffling "no events" failure.
+    probe = socket.socket()
+    probe.settimeout(0.5)
     try:
-        # The forwarder is fire-and-forget: an event POSTed before the
-        # receiver binds is lost for good, so wait for the listener.
+        probe.connect(("127.0.0.1", WEBHOOK_PORT))
+        raise AssertionError(
+            "something is already listening on :%d — stop it first (a "
+            "leftover hook_receiver.py from another run?), the broker's "
+            "webhook URL is fixed at build time" % WEBHOOK_PORT)
+    except OSError:
+        pass
+    finally:
+        probe.close()
+
+    rec = subprocess.Popen(
+        [sys.executable, receiver, "--port", str(WEBHOOK_PORT)],
+        stdout=open(rec_log, "w", encoding="utf-8"),
+        stderr=open(rec_err, "w", encoding="utf-8"),
+        start_new_session=True)
+    try:
+        # The forwarder is fire-and-forget with no retry: an event POSTed
+        # before the receiver binds is lost for good, so wait for the listen
+        # socket before publishing anything.
         deadline = time.time() + 15
         listening = False
         while time.time() < deadline:
-            if docker(container, ["sh", "-lc",
-                                  "ss -ltn | grep -q :%d" % WEBHOOK_PORT]
-                      ).returncode == 0:
-                listening = True
+            if rec.poll() is not None:
                 break
-            time.sleep(0.3)
+            s = socket.socket()
+            s.settimeout(0.5)
+            try:
+                s.connect(("127.0.0.1", WEBHOOK_PORT))
+            except OSError:
+                time.sleep(0.2)
+                continue
+            finally:
+                s.close()
+            # Re-check the child after the connect: a bind failure kills it
+            # asynchronously, and only our own receiver's log is meaningful.
+            time.sleep(0.2)
+            if rec.poll() is not None:
+                break
+            listening = True
+            break
         if not listening:
-            p = docker(container, ["cat", rec_err])
+            err = Path(rec_err).read_text(encoding="utf-8", errors="replace")
             raise AssertionError("hook_receiver.py never listened on :%d: %s"
-                                 % (WEBHOOK_PORT, (p.stdout or "")[-400:]))
+                                 % (WEBHOOK_PORT, err[-400:]))
 
         c = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION1,
                         client_id="zf-webhook-pub")
@@ -600,11 +666,11 @@ def group_webhook_smoke(addr: str, env: dict) -> None:
         payload = ""
         for attempt in range(3):
             payload = "zf-webhook-%d-%d" % (int(time.time()), attempt)
-            c.publish("test/webhook", payload, 1)
+            c.publish("hook/webhook", payload, 1)
             deadline = time.time() + 10
             while time.time() < deadline:
-                p = docker(container, ["cat", rec_log])
-                seen = p.stdout if p.returncode == 0 else ""
+                seen = Path(rec_log).read_text(encoding="utf-8",
+                                               errors="replace")
                 if "client_connack" in seen and payload in seen:
                     break
                 time.sleep(1)
@@ -617,7 +683,7 @@ def group_webhook_smoke(addr: str, env: dict) -> None:
         assert "message_publish" in seen and payload in seen, \
             "no message_publish event for %s: %r" % (payload, seen[-400:])
     finally:
-        docker(container, ["pkill", "-f", "hook_receiver[.]py"])
+        _kill_worker_group(rec)
 
 
 def group_capacity(addr: str, env: dict) -> None:
@@ -711,6 +777,11 @@ def worker_main(name: str) -> int:
     log("[worker %s] broker %s:%d" % (name, addr, MQTT_PORT))
     try:
         GROUP_FUNCS[name](addr, env)
+    except SkipGroup as e:
+        log("[worker %s] SKIP: %s" % (name, e))
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(SKIP_EXIT)
     except BaseException as e:                       # noqa: BLE001
         import traceback
         traceback.print_exc()
@@ -769,6 +840,9 @@ def run_worker(name: str, addr: str, args, timeout: float, attempts: int):
         "ZF_REST_PORT": str(REST_PORT),
         "ZF_WS_PORT": str(WS_PORT),
         "ZF_WEBHOOK_PORT": str(WEBHOOK_PORT),
+        "ZF_REST_USER": args.rest_user,
+        "ZF_REST_PASS": args.rest_pass,
+        "ZF_WEBHOOK": "1" if args.webhook else "",
         "ZF_CONTAINER": args.container,
         "ZF_WORKDIR": args.workdir,
         "ZF_TIME_SCALE": str(args.time_scale),
@@ -803,6 +877,10 @@ def run_worker(name: str, addr: str, args, timeout: float, attempts: int):
             last_out = out.read()
         if timed_out:
             return ("TIMEOUT", last_out[-4000:])
+        if proc.returncode == SKIP_EXIT:
+            # Not retryable: the broker's configuration will not change
+            # between attempts.
+            return ("SKIP", last_out)
         if proc.returncode == 0:
             return ("PASS", last_out)
         # Show this attempt's failure now: if a later attempt passes,
@@ -828,6 +906,16 @@ def parse_args(argv=None):
     ap.add_argument("--list", action="store_true", help="list groups and exit")
     ap.add_argument("--addr", default=None,
                     help="broker address (default: container IP)")
+    ap.add_argument("--rest-user", default=REST_USER,
+                    help="REST Basic auth user (default: %s)" % REST_USER)
+    ap.add_argument("--rest-pass", default=REST_PASS,
+                    help="REST Basic auth password (default: %s)" % REST_PASS)
+    ap.add_argument("--webhook", action="store_true",
+                    help="the broker under test has the webhook forwarder "
+                         "enabled; run hook_receiver.py locally and expect "
+                         "events.  Without it the webhook_smoke group skips "
+                         "(qemu_x86 enables it by default, a real board "
+                         "needs CONFIG_BROKER_WEBHOOK_URL in local.conf)")
     ap.add_argument("--container", default=DEFAULT_CONTAINER,
                     help="docker container running qemu (default: %s)"
                          % DEFAULT_CONTAINER)
@@ -978,6 +1066,7 @@ def main(argv=None) -> int:
 
     results = []
     failed = 0
+    skipped = 0
     broker_gone = False
     try:
         for idx, name in enumerate(selected, 1):
@@ -1007,6 +1096,13 @@ def main(argv=None) -> int:
             status, output = run_worker(name, addr, args, timeout, attempts)
             dt = time.time() - t0
             results.append((name, status, dt))
+            if status == "SKIP":
+                skipped += 1
+                log("[%d/%d] %-14s SKIP  (%.1fs)"
+                    % (idx, len(selected), name, dt))
+                for line in (output or "").rstrip().splitlines()[-10:]:
+                    log("    | " + line)
+                continue
             if status == "PASS":
                 log("[%d/%d] %-14s PASS  (%.1fs)"
                     % (idx, len(selected), name, dt))
@@ -1041,7 +1137,13 @@ def main(argv=None) -> int:
     log("-" * 72)
     for name, status, dt in results:
         log("%-14s %-8s %6.1fs" % (name, status, dt))
-    log("RESULT: pass=%d fail=%d" % (len(results) - failed, failed))
+    # Keep the long-standing "pass=N fail=M" prefix intact for anything
+    # parsing it; only decorate when a group actually skipped.
+    summary = "RESULT: pass=%d fail=%d" % (
+        len(results) - failed - skipped, failed)
+    if skipped:
+        summary += " skip=%d" % skipped
+    log(summary)
     if broker_gone:
         return 2
     return 1 if failed else 0
